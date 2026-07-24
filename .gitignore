@@ -1,0 +1,13 @@
+config/.env
+__pycache__/
+*.pyc
+logs/*.log
+logs/
+.venv/
+*.pt
+*.pkl
+models/*.json
+models/*.pt
+models/*.pkl
+models/*.txt
+.env
