@@ -107,8 +107,8 @@ class Settings:
     # ML / AI
     ml_model_dir: str = os.getenv("ML_MODEL_DIR", "models")
     ml_retrain_interval_hours: int = _int("ML_RETRAIN_INTERVAL_HOURS", 168)
-    ml_ensemble_weights: List[float] = _list_float(
-        "ML_ENSEMBLE_WEIGHTS", [0.35, 0.25, 0.20, 0.20]
+    ml_ensemble_weights: List[float] = field(
+        default_factory=lambda: _list_float("ML_ENSEMBLE_WEIGHTS", [0.35, 0.25, 0.20, 0.20])
     )
     ml_sentiment_model: str = os.getenv(
         "ML_SENTIMENT_MODEL", "cardiffnlp/twitter-roberta-base-sentiment-latest"

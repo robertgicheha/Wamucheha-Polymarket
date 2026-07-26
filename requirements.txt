@@ -7,7 +7,7 @@ web3>=6.0.0
 py-clob-client>=0.10.0
 
 # Exchange connectors
-python-okx>=5.0.0
+python-okx>=0.4.0
 
 # Data & ML
 pandas>=2.0.0
