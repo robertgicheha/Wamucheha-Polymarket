@@ -11,3 +11,9 @@ models/*.pt
 models/*.pkl
 models/*.txt
 .env
+*.bak
+.env
+.env.*
+=
+*.save
+*.save.*
