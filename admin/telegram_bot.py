@@ -14,6 +14,11 @@ Commands:
   /trades [n]        last n trades (default 10, max 50)
   /pnl [today|week|all]
   /balance
+  /compound [on|off]  enable/disable profit compounding
+  /compound_status    show compounding stats and growth rate
+  /withdraw <amount>  withdraw profits to wallet
+  /arb               show arbitrage opportunities and PnL
+  /markets           show active 5-minute market windows
   /halt [reason]     pause trading (bot finishes any in-flight bet first)
   /resume            resume trading
   /restart           hard restart via systemd (asks for confirmation)
@@ -113,6 +118,143 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"```\n{r.json()}\n```", parse_mode="Markdown")
 
 
+async def compound_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return await _reply_unauthorized(update)
+    if not context.args:
+        return await update.message.reply_text("Usage: /compound [on|off]")
+    setting = context.args[0].lower()
+    if setting not in ("on", "off"):
+        return await update.message.reply_text("Usage: /compound [on|off]")
+    enabled = setting == "on"
+    r = await client.post("/compound", json={"enabled": enabled})
+    if r.status_code == 200:
+        state = "ENABLED" if enabled else "DISABLED"
+        await update.message.reply_text(f"Profit compounding {state}")
+    else:
+        await update.message.reply_text(f"Failed: {r.text}")
+
+
+async def compound_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return await _reply_unauthorized(update)
+    r = await client.get("/compound_status")
+    if r.status_code != 200:
+        return await update.message.reply_text("Compound status not available.")
+    d = r.json()
+    await update.message.reply_text(
+        f"**Compounding:** {'ON' if d.get('enabled') else 'OFF'}\n"
+        f"Principal: ${d.get('principal', 0):.2f}\n"
+        f"Bankroll: ${d.get('bankroll', 0):.2f}\n"
+        f"Profit: ${d.get('total_profit', 0):.2f} ({d.get('profit_pct', 0):.1f}%)\n"
+        f"Withdrawn: ${d.get('total_withdrawn', 0):.2f}\n"
+        f"Win Rate: {d.get('win_rate', 0):.1f}%\n"
+        f"Trades: {d.get('total_trades', 0)} (W:{d.get('total_wins', 0)} L:{d.get('total_losses', 0)})",
+        parse_mode="Markdown",
+    )
+
+
+async def withdraw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return await _reply_unauthorized(update)
+    if not context.args:
+        return await update.message.reply_text("Usage: /withdraw <amount_usd>")
+    try:
+        amount = float(context.args[0])
+    except ValueError:
+        return await update.message.reply_text("Invalid amount. Usage: /withdraw 50.00")
+    r = await client.post("/withdraw", json={"amount_usd": amount})
+    if r.status_code == 200:
+        d = r.json()
+        await update.message.reply_text(
+            f"Withdrawal requested: ${amount:.2f}\n"
+            f"Status: {d.get('status', 'pending')}\n"
+            f"Remaining profit: ${d.get('remaining_profit', 0):.2f}"
+        )
+    else:
+        await update.message.reply_text(f"Withdrawal failed: {r.text}")
+
+
+async def arb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return await _reply_unauthorized(update)
+    r = await client.get("/arb")
+    if r.status_code != 200:
+        return await update.message.reply_text("Arb data not available.")
+    d = r.json()
+    lines = [
+        f"**Arbitrage Stats:**",
+        f"Bankroll: ${d.get('bankroll', 0):.2f}",
+        f"Open Positions: {d.get('open_positions', 0)}",
+        f"Total PnL: ${d.get('total_pnl', 0):.4f}",
+        f"Win Rate: {d.get('win_rate', 0):.1f}%",
+        f"PM Markets: {d.get('pm_markets_tracked', 0)} | Kalshi: {d.get('kalshi_contracts_tracked', 0)}",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def markets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return await _reply_unauthorized(update)
+    r = await client.get("/markets")
+    if r.status_code != 200:
+        return await update.message.reply_text("Market data not available.")
+    d = r.json()
+    markets = d.get("markets", [])
+    if not markets:
+        return await update.message.reply_text("No active market windows.")
+    lines = ["**5-Minute Market Windows:**\n"]
+    for m in markets[:5]:
+        phase_emoji = {"discover": "D", "start": "S", "run": "R", "end": "E", "settled": "X"}.get(m.get("phase", ""), "?")
+        lines.append(
+            f"[{phase_emoji}] {m.get('asset', '?').upper()} | "
+            f"Beat: ${m.get('price_to_beat', 0):.2f} | "
+            f"YES: {m.get('current_yes_price', 0.5):.3f} | "
+            f"Time: {m.get('time_remaining', 0):.0f}s | "
+            f"PnL: ${m.get('pnl_usd', 0):+.4f}"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return await _reply_unauthorized(update)
+    period = context.args[0] if context.args else "hour"
+    if period not in ("hour", "session", "daily"):
+        return await update.message.reply_text("Usage: /report [hour|session|daily]")
+    r = await client.get(f"/report?period={period}")
+    if r.status_code != 200:
+        return await update.message.reply_text("Report not available.")
+    d = r.json()
+    if d.get("total_trades", 0) == 0 and period == "hour":
+        await update.message.reply_text("No trades in the last hour.")
+        return
+    lines = [
+        f"**{'Session' if period == 'session' else 'Hourly' if period == 'hour' else 'Daily'} Report:**\n",
+        f"Trades: {d.get('total_trades', 0)} (W:{d.get('wins', 0)} L:{d.get('losses', 0)})",
+        f"Win Rate: {d.get('win_rate_pct', 0):.1f}%",
+        f"Gross Profit: ${d.get('gross_profit', 0):.4f}",
+        f"Gross Loss: ${d.get('gross_loss', 0):.4f}",
+        f"Net PnL: ${d.get('net_pnl', 0):+.4f}",
+        f"Fees: ${d.get('total_fees', 0):.4f}",
+        f"Volume: ${d.get('total_volume', 0):.2f}",
+        f"Best: ${d.get('largest_win', 0):+.4f} | Worst: ${d.get('largest_loss', 0):+.4f}",
+        f"Bankroll: ${d.get('current_bankroll', 0):.2f}",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return await _reply_unauthorized(update)
+    r = await client.post("/backup")
+    if r.status_code == 200:
+        d = r.json()
+        await update.message.reply_text(f"Backup completed: {d.get('backup_path', 'unknown')}")
+    else:
+        await update.message.reply_text(f"Backup failed: {r.text}")
+
+
 async def halt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return await _reply_unauthorized(update)
@@ -151,7 +293,9 @@ async def restart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "/status /logs [n] /trades [n] /pnl [today|week|all] "
-        "/balance /halt [reason] /resume /restart"
+        "/balance /compound [on|off] /compound_status /withdraw <amount> "
+        "/arb /markets /report [hour|session|daily] /backup "
+        "/halt [reason] /resume /restart"
     )
 
 
@@ -162,6 +306,13 @@ def main():
     app.add_handler(CommandHandler("trades", trades_cmd))
     app.add_handler(CommandHandler("pnl", pnl_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
+    app.add_handler(CommandHandler("compound", compound_cmd))
+    app.add_handler(CommandHandler("compound_status", compound_status_cmd))
+    app.add_handler(CommandHandler("withdraw", withdraw_cmd))
+    app.add_handler(CommandHandler("arb", arb_cmd))
+    app.add_handler(CommandHandler("markets", markets_cmd))
+    app.add_handler(CommandHandler("report", report_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("halt", halt_cmd))
     app.add_handler(CommandHandler("resume", resume_cmd))
     app.add_handler(CommandHandler("restart", restart_cmd))

@@ -19,29 +19,14 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-# Category keyword mapping for market filtering — Polymarket doesn't natively
-# tag markets as crypto/politics/sports/macro, so we match on question text.
+# Category keyword mapping for market filtering — crypto + gold only.
+# Sports, politics, macro categories removed entirely.
 CATEGORY_KEYWORDS = {
     "crypto": [
         "bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "sol",
-        "xrp", "dogecoin", "doge", "price", "blockchain", "defi",
-        "token", "coin", "mining", "halving",
-    ],
-    "politics": [
-        "president", "election", "vote", "congress", "senate", "governor",
-        "party", "democrat", "republican", "trump", "biden", "political",
-        "legislation", "bill", "impeach", "nominee", "primary", "caucus",
-    ],
-    "sports": [
-        "nba", "nfl", "mlb", "nhl", "soccer", "football", "basketball",
-        "baseball", "tennis", "f1", "formula", "olympics", "world cup",
-        "championship", "playoff", "super bowl", "mvp", "score", "win",
-        "match", "game", "season", "tournament",
-    ],
-    "macro": [
-        "fed", "interest rate", "inflation", "cpi", "gdp", "unemployment",
-        "recession", "fomc", "treasury", "bond yield", "tariff", "trade war",
-        "economic", "monetary policy", "fiscal", "stimulus",
+        "xrp", "ripple", "dogecoin", "doge", "price", "blockchain", "defi",
+        "token", "coin", "mining", "halving", "gold", "xau",
+        "above", "below", "up", "down", "beat",
     ],
 }
 
