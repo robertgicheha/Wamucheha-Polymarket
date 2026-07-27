@@ -1,10 +1,11 @@
 """
-In-process state holder for dashboard and main.py. Tracks compounding metrics,
-withdrawal history, and profit milestones. main.py calls update_state() each cycle.
+In-process state holder for dashboard and main.py.
+Tracks compounding metrics, BRTI price, arbitrage P&L,
+TTE model status, and withdrawal history.
 """
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List
+from typing import Dict, List, Optional
 
 from risk.risk_manager import Position, RiskManager, TradeResult, WithdrawalRecord
 
@@ -33,13 +34,34 @@ class DashboardState:
 
     # Status
     halted: bool = False
-    halt_reason: str | None = None
+    halt_reason: Optional[str] = None
     mode: str = "paper"
 
     # Positions & history
     open_positions: List[Position] = field(default_factory=list)
     recent_trades: List[TradeResult] = field(default_factory=list)
     withdrawal_history: List[WithdrawalRecord] = field(default_factory=list)
+
+    # BRTI
+    brti_price: float = 0.0
+    brti_spread_bps: float = 0.0
+    brti_exchanges_used: int = 0
+    brti_tick_count: int = 0
+
+    # Arbitrage
+    arb_pnl: float = 0.0
+    arb_open_positions: int = 0
+    arb_closed_positions: int = 0
+    arb_win_rate: float = 0.0
+    arb_opportunities: int = 0
+
+    # TTE / ML
+    tte_models_fitted: int = 0
+    tte_total_models: int = 900
+    last_retrain: Optional[str] = None
+
+    # Strategy
+    active_strategy: str = "kelly"
 
     # Milestone tracking
     last_milestone_pct: float = 0.0
@@ -49,9 +71,46 @@ class DashboardState:
 _state = DashboardState()
 
 
-def update_state(risk_manager: RiskManager) -> None:
+def update_state(
+    risk_manager: RiskManager,
+    brti_engine=None,
+    arb_engine=None,
+    tte_orchestrator=None,
+) -> None:
     global _state
     from config.settings import settings
+
+    brti_price = 0.0
+    brti_spread = 0.0
+    brti_exchanges = 0
+    brti_ticks = 0
+    if brti_engine and brti_engine.last_tick:
+        brti_price = brti_engine.last_tick.brti_price
+        brti_spread = brti_engine.last_tick.spread_bps
+        brti_exchanges = len(brti_engine.last_tick.exchanges_used)
+        brti_ticks = brti_engine._tick_count
+
+    arb_pnl = 0.0
+    arb_open = 0
+    arb_closed = 0
+    arb_wr = 0.0
+    arb_opps = 0
+    if arb_engine:
+        arb_stats = arb_engine.stats
+        arb_pnl = arb_stats.get("total_pnl", 0)
+        arb_open = arb_stats.get("open_positions", 0)
+        arb_closed = arb_stats.get("positions_closed", 0)
+        arb_wr = arb_stats.get("win_rate", 0)
+        arb_opps = arb_stats.get("total_opportunities", 0)
+
+    tte_fitted = 0
+    tte_total = 900
+    last_retrain = None
+    if tte_orchestrator:
+        tte_stats = tte_orchestrator.stats
+        tte_fitted = tte_stats.get("fitted_tte_models", 0)
+        tte_total = tte_stats.get("total_tte_models", 900)
+        last_retrain = tte_stats.get("last_full_retrain")
 
     _state = DashboardState(
         bankroll=risk_manager.bankroll,
@@ -74,6 +133,19 @@ def update_state(risk_manager: RiskManager) -> None:
         open_positions=list(risk_manager.open_positions.values()),
         recent_trades=risk_manager.trade_history[-20:],
         withdrawal_history=risk_manager.withdrawal_history[-10:],
+        brti_price=brti_price,
+        brti_spread_bps=brti_spread,
+        brti_exchanges_used=brti_exchanges,
+        brti_tick_count=brti_ticks,
+        arb_pnl=arb_pnl,
+        arb_open_positions=arb_open,
+        arb_closed_positions=arb_closed,
+        arb_win_rate=arb_wr,
+        arb_opportunities=arb_opps,
+        tte_models_fitted=tte_fitted,
+        tte_total_models=tte_total,
+        last_retrain=last_retrain,
+        active_strategy=settings.strategy,
     )
 
 

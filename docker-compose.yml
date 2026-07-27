@@ -1,0 +1,85 @@
+# docker-compose.yml — Wamucheha Polymarket Bot
+#
+# Services:
+#   bot          — main trading bot process
+#   admin-api    — internal control-plane API (Telegram/Discord backend)
+#   backup       — periodic SQLite backup sidecar
+#
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f bot
+#   docker compose exec backup /backup.sh  # manual backup
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wamucheha-bot
+    restart: unless-stopped
+    env_file:
+      - config/.env
+    volumes:
+      - bot-data:/app/data
+      - bot-logs:/app/logs
+      - bot-models:/app/models
+    networks:
+      - bot-net
+    depends_on:
+      - admin-api
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+  admin-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.admin
+    container_name: wamucheha-admin
+    restart: unless-stopped
+    env_file:
+      - config/.env
+    volumes:
+      - bot-data:/app/data
+      - bot-logs:/app/logs
+    ports:
+      - "127.0.0.1:8787:8787"
+    networks:
+      - bot-net
+
+  backup:
+    image: alpine:3.19
+    container_name: wamucheha-backup
+    restart: unless-stopped
+    volumes:
+      - bot-data:/data:ro
+      - backup-vol:/backups
+      - ./scripts/backup.sh:/backup.sh:ro
+    entrypoint: ["/bin/sh", "/backup.sh"]
+    environment:
+      - BACKUP_INTERVAL=${BACKUP_INTERVAL_HOURS:-6}
+      - BACKUP_RETAIN_DAYS=${BACKUP_RETAIN_DAYS:-30}
+      - DATA_DIR=/data
+      - BACKUP_DIR=/backups
+    networks:
+      - bot-net
+
+volumes:
+  bot-data:
+    driver: local
+  bot-logs:
+    driver: local
+  bot-models:
+    driver: local
+  backup-vol:
+    driver: local
+    driver_opts:
+      type: none
+      device: ${BACKUP_HOST_PATH:-/opt/wamucheha-backups}
+      o: bind
+
+networks:
+  bot-net:
+    driver: bridge
