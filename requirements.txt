@@ -5,6 +5,9 @@ requests>=2.31.0
 # Blockchain / Polymarket
 web3>=6.0.0
 py-clob-client>=0.10.0
+eth-abi>=4.2.0
+eth-account>=0.9.0
+eth-utils>=2.3.0
 
 # Exchange connectors
 python-okx>=0.4.0
@@ -32,6 +35,33 @@ scipy>=1.10.0
 
 # Dashboard
 flask>=3.0.0
+
+# WebSocket (BRTI exchange feeds + Polymarket WS)
+websockets>=12.0
+aiohttp>=3.9.0
+
+# Async HTTP (for admin API, relayer, etc.)
+httpx>=0.25.0
+
+# PMXT unified prediction market API
+# pmxt  # install from github.com/pmxt-dev/pmxt
+
+# Model persistence
+joblib>=1.3.0
+
+# FastAPI (admin API)
+uvicorn>=0.23.0
+fastapi>=0.104.0
+
+# Gnosis Safe / EIP-712
+safe-pyeth-signer>=0.1.0
+py-ecc>=1.7.0
+
+# Telegram bot
+python-telegram-bot>=20.0
+
+# Discord bot
+discord.py>=2.3.0
 
 # Testing
 pytest>=7.0.0

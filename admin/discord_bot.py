@@ -11,7 +11,8 @@ Setup:
   4. python3 discord_bot.py   (or run via systemd, see systemd/)
 
 Slash commands mirror the Telegram bot: /status /logs /trades /pnl
-/balance /halt /resume /restart
+/balance /compound /compound_status /withdraw /arb /markets
+/halt /resume /restart
 """
 
 import os
@@ -122,6 +123,147 @@ async def balance_cmd(interaction: discord.Interaction):
     if r.status_code != 200:
         return await interaction.response.send_message("Balance file not available.")
     await interaction.response.send_message(f"```\n{r.json()}\n```")
+
+
+@tree.command(name="compound", description="Enable/disable profit compounding", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(enabled="on or off")
+@app_commands.choices(enabled=[
+    app_commands.Choice(name="on", value="on"),
+    app_commands.Choice(name="off", value="off"),
+])
+async def compound_cmd(interaction: discord.Interaction, enabled: app_commands.Choice[str] = None):
+    if not _authorized(interaction):
+        return await _deny(interaction)
+    setting = enabled.value if enabled else "on"
+    r = await http_client.post("/compound", json={"enabled": setting == "on"})
+    if r.status_code == 200:
+        state = "ENABLED" if setting == "on" else "DISABLED"
+        await interaction.response.send_message(f"Profit compounding {state}")
+    else:
+        await interaction.response.send_message(f"Failed: {r.text}")
+
+
+@tree.command(name="compound_status", description="Show compounding stats and growth rate", guild=discord.Object(id=GUILD_ID))
+async def compound_status_cmd(interaction: discord.Interaction):
+    if not _authorized(interaction):
+        return await _deny(interaction)
+    r = await http_client.get("/compound_status")
+    if r.status_code != 200:
+        return await interaction.response.send_message("Compound status not available.")
+    d = r.json()
+    await interaction.response.send_message(
+        f"**Compounding:** {'ON' if d.get('enabled') else 'OFF'}\n"
+        f"Principal: ${d.get('principal', 0):.2f}\n"
+        f"Bankroll: ${d.get('bankroll', 0):.2f}\n"
+        f"Profit: ${d.get('total_profit', 0):.2f} ({d.get('profit_pct', 0):.1f}%)\n"
+        f"Withdrawn: ${d.get('total_withdrawn', 0):.2f}\n"
+        f"Win Rate: {d.get('win_rate', 0):.1f}%\n"
+        f"Trades: {d.get('total_trades', 0)} (W:{d.get('total_wins', 0)} L:{d.get('total_losses', 0)})"
+    )
+
+
+@tree.command(name="withdraw", description="Withdraw profits to wallet", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(amount="amount in USD to withdraw")
+async def withdraw_cmd(interaction: discord.Interaction, amount: float):
+    if not _authorized(interaction):
+        return await _deny(interaction)
+    r = await http_client.post("/withdraw", json={"amount_usd": amount})
+    if r.status_code == 200:
+        d = r.json()
+        await interaction.response.send_message(
+            f"Withdrawal requested: ${amount:.2f}\n"
+            f"Status: {d.get('status', 'pending')}\n"
+            f"Remaining profit: ${d.get('remaining_profit', 0):.2f}"
+        )
+    else:
+        await interaction.response.send_message(f"Withdrawal failed: {r.text}")
+
+
+@tree.command(name="arb", description="Show arbitrage opportunities and PnL", guild=discord.Object(id=GUILD_ID))
+async def arb_cmd(interaction: discord.Interaction):
+    if not _authorized(interaction):
+        return await _deny(interaction)
+    r = await http_client.get("/arb")
+    if r.status_code != 200:
+        return await interaction.response.send_message("Arb data not available.")
+    d = r.json()
+    await interaction.response.send_message(
+        f"**Arbitrage Stats:**\n"
+        f"Bankroll: ${d.get('bankroll', 0):.2f}\n"
+        f"Open Positions: {d.get('open_positions', 0)}\n"
+        f"Total PnL: ${d.get('total_pnl', 0):.4f}\n"
+        f"Win Rate: {d.get('win_rate', 0):.1f}%\n"
+        f"PM Markets: {d.get('pm_markets_tracked', 0)} | Kalshi: {d.get('kalshi_contracts_tracked', 0)}"
+    )
+
+
+@tree.command(name="markets", description="Show active 5-minute market windows", guild=discord.Object(id=GUILD_ID))
+async def markets_cmd(interaction: discord.Interaction):
+    if not _authorized(interaction):
+        return await _deny(interaction)
+    r = await http_client.get("/markets")
+    if r.status_code != 200:
+        return await interaction.response.send_message("Market data not available.")
+    d = r.json()
+    markets = d.get("markets", [])
+    if not markets:
+        return await interaction.response.send_message("No active market windows.")
+    lines = ["**5-Minute Market Windows:**\n"]
+    for m in markets[:5]:
+        phase_emoji = {"discover": "D", "start": "S", "run": "R", "end": "E", "settled": "X"}.get(m.get("phase", ""), "?")
+        lines.append(
+            f"[{phase_emoji}] {m.get('asset', '?').upper()} | "
+            f"Beat: ${m.get('price_to_beat', 0):.2f} | "
+            f"YES: {m.get('current_yes_price', 0.5):.3f} | "
+            f"Time: {m.get('time_remaining', 0):.0f}s | "
+            f"PnL: ${m.get('pnl_usd', 0):+.4f}"
+        )
+    await interaction.response.send_message("\n".join(lines))
+
+
+@tree.command(name="report", description="Hourly/session/daily trade report", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(period="report period")
+@app_commands.choices(period=[
+    app_commands.Choice(name="hour", value="hour"),
+    app_commands.Choice(name="session", value="session"),
+    app_commands.Choice(name="daily", value="daily"),
+])
+async def report_cmd(interaction: discord.Interaction, period: app_commands.Choice[str] = None):
+    if not _authorized(interaction):
+        return await _deny(interaction)
+    p = period.value if period else "hour"
+    r = await http_client.get(f"/report?period={p}")
+    if r.status_code != 200:
+        return await interaction.response.send_message("Report not available.")
+    d = r.json()
+    if d.get("total_trades", 0) == 0 and p == "hour":
+        return await interaction.response.send_message("No trades in the last hour.")
+    label = "Session" if p == "session" else "Hourly" if p == "hour" else "Daily"
+    lines = [
+        f"**{label} Report:**\n",
+        f"Trades: {d.get('total_trades', 0)} (W:{d.get('wins', 0)} L:{d.get('losses', 0)})",
+        f"Win Rate: {d.get('win_rate_pct', 0):.1f}%",
+        f"Gross Profit: ${d.get('gross_profit', 0):.4f}",
+        f"Gross Loss: ${d.get('gross_loss', 0):.4f}",
+        f"Net PnL: ${d.get('net_pnl', 0):+.4f}",
+        f"Fees: ${d.get('total_fees', 0):.4f}",
+        f"Volume: ${d.get('total_volume', 0):.2f}",
+        f"Best: ${d.get('largest_win', 0):+.4f} | Worst: ${d.get('largest_loss', 0):+.4f}",
+        f"Bankroll: ${d.get('current_bankroll', 0):.2f}",
+    ]
+    await interaction.response.send_message("\n".join(lines))
+
+
+@tree.command(name="backup", description="Trigger a manual database backup", guild=discord.Object(id=GUILD_ID))
+async def backup_cmd(interaction: discord.Interaction):
+    if not _authorized(interaction):
+        return await _deny(interaction)
+    r = await http_client.post("/backup")
+    if r.status_code == 200:
+        d = r.json()
+        await interaction.response.send_message(f"Backup completed: {d.get('backup_path', 'unknown')}")
+    else:
+        await interaction.response.send_message(f"Backup failed: {r.text}")
 
 
 @tree.command(name="halt", description="Pause trading", guild=discord.Object(id=GUILD_ID))

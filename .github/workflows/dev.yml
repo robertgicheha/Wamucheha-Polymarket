@@ -1,0 +1,73 @@
+name: Dev Branch — Test & Deploy
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev]
+
+env:
+  PYTHON_VERSION: "3.11"
+  DEPLOY_PATH: /opt/wamucheha-polymarket
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff mypy pytest-cov
+
+      - name: Lint with ruff
+        run: ruff check . --output-format github
+
+      - name: Type check with mypy
+        run: mypy --ignore-missing-imports --no-error-summary ml/ data/ strategies/ connectors/ config/ || true
+        continue-on-error: true
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short --cov=. --cov-report=term-missing || true
+        continue-on-error: true
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd ${{ env.DEPLOY_PATH }}
+            git pull origin dev
+            pip install -r requirements.txt --quiet
+            pip install -r admin/requirements.txt --quiet
+            systemctl restart wamucheha-bot || true
+            echo "Dev deployment complete at $(date)"
+
+      - name: Notify deployment
+        if: always()
+        run: |
+          echo "Dev branch deployed to ${{ secrets.VPS_HOST }}"

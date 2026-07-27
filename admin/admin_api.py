@@ -48,6 +48,7 @@ BOT_DB_PATH = os.environ.get("BOT_DB_PATH", "/opt/btc-bot/data/trades.db")
 BOT_LOG_PATH = os.environ.get("BOT_LOG_PATH", "/opt/btc-bot/logs/bot.log")
 CONTROL_FILE = os.environ.get("CONTROL_FILE_PATH", "/opt/btc-bot/data/control.json")
 BALANCE_FILE = os.environ.get("BALANCE_FILE_PATH", "/opt/btc-bot/data/balance.json")
+COMPOUND_STATE_FILE = os.environ.get("COMPOUND_STATE_FILE_PATH", "/opt/btc-bot/data/compound.json")
 BOT_SYSTEMD_UNIT = os.environ.get("BOT_SYSTEMD_UNIT", "btc-bot.service")
 TRADES_TABLE = os.environ.get("TRADES_TABLE_NAME", "trades")
 
@@ -91,6 +92,24 @@ def write_control(halted: bool, reason: Optional[str], actor: str):
     }, indent=2))
 
 
+def read_compound_state() -> dict:
+    p = Path(COMPOUND_STATE_FILE)
+    if not p.exists():
+        return {"enabled": True}
+    try:
+        return json.loads(p.read_text())
+    except json.JSONDecodeError:
+        return {"enabled": True}
+
+
+def write_compound_state(enabled: bool):
+    Path(COMPOUND_STATE_FILE).parent.mkdir(parents=True, exist_ok=True)
+    state = read_compound_state()
+    state["enabled"] = enabled
+    state["changed_at"] = datetime.now(timezone.utc).isoformat()
+    Path(COMPOUND_STATE_FILE).write_text(json.dumps(state, indent=2))
+
+
 # ── Schemas ──────────────────────────────────────────────────────────────
 class HaltRequest(BaseModel):
     reason: str = "manual halt"
@@ -99,6 +118,14 @@ class HaltRequest(BaseModel):
 
 class ResumeRequest(BaseModel):
     actor: str = "unknown"
+
+
+class CompoundRequest(BaseModel):
+    enabled: bool
+
+
+class WithdrawRequest(BaseModel):
+    amount_usd: float
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────
@@ -201,6 +228,140 @@ def balance(authorization: str = Header(None)):
     if not Path(BALANCE_FILE).exists():
         raise HTTPException(status_code=404, detail="balance file not found — have the bot write balance.json")
     return json.loads(Path(BALANCE_FILE).read_text())
+
+
+@app.get("/compound_status")
+def compound_status(authorization: str = Header(None)):
+    check_auth(authorization)
+    state = read_compound_state()
+    balance_data = {}
+    if Path(BALANCE_FILE).exists():
+        try:
+            balance_data = json.loads(Path(BALANCE_FILE).read_text())
+        except Exception:
+            pass
+    summary = {
+        "enabled": state.get("enabled", True),
+        "principal": balance_data.get("principal", 0.0),
+        "bankroll": balance_data.get("bankroll", 0.0),
+        "total_profit": balance_data.get("total_profit", 0.0),
+        "profit_pct": balance_data.get("profit_pct", 0.0),
+        "total_withdrawn": balance_data.get("total_withdrawn", 0.0),
+        "win_rate": balance_data.get("win_rate", 0.0),
+        "total_trades": balance_data.get("total_trades", 0),
+        "total_wins": balance_data.get("total_wins", 0),
+        "total_losses": balance_data.get("total_losses", 0),
+    }
+    return summary
+
+
+@app.post("/compound")
+def set_compound(req: CompoundRequest, authorization: str = Header(None)):
+    check_auth(authorization)
+    write_compound_state(req.enabled)
+    state = "enabled" if req.enabled else "disabled"
+    return {"ok": True, "compounding": state}
+
+
+@app.post("/withdraw")
+def withdraw(req: WithdrawRequest, authorization: str = Header(None)):
+    check_auth(authorization)
+    balance_data = {}
+    if Path(BALANCE_FILE).exists():
+        try:
+            balance_data = json.loads(Path(BALANCE_FILE).read_text())
+        except Exception:
+            pass
+    current_profit = balance_data.get("total_profit", 0.0)
+    if req.amount_usd > current_profit:
+        raise HTTPException(status_code=400, detail=f"Insufficient profit: ${current_profit:.2f} available")
+    balance_data["total_profit"] = current_profit - req.amount_usd
+    balance_data["total_withdrawn"] = balance_data.get("total_withdrawn", 0.0) + req.amount_usd
+    if Path(BALANCE_FILE).exists():
+        Path(BALANCE_FILE).write_text(json.dumps(balance_data, indent=2))
+    return {
+        "ok": True,
+        "status": "withdrawn",
+        "amount": req.amount_usd,
+        "remaining_profit": balance_data["total_profit"],
+    }
+
+
+@app.get("/arb")
+def arb(authorization: str = Header(None)):
+    check_auth(authorization)
+    balance_data = {}
+    if Path(BALANCE_FILE).exists():
+        try:
+            balance_data = json.loads(Path(BALANCE_FILE).read_text())
+        except Exception:
+            pass
+    arb_data = {}
+    arb_file = Path(BOT_DB_PATH).parent / "arb_state.json"
+    if arb_file.exists():
+        try:
+            arb_data = json.loads(arb_file.read_text())
+        except Exception:
+            pass
+    return {
+        "bankroll": balance_data.get("bankroll", 0.0),
+        "open_positions": arb_data.get("open_positions", 0),
+        "total_pnl": arb_data.get("total_pnl", 0.0),
+        "win_rate": arb_data.get("win_rate", 0.0),
+        "pm_markets_tracked": arb_data.get("pm_markets_tracked", 0),
+        "kalshi_contracts_tracked": arb_data.get("kalshi_contracts_tracked", 0),
+    }
+
+
+@app.get("/markets")
+def markets(authorization: str = Header(None)):
+    check_auth(authorization)
+    markets_file = Path(BOT_DB_PATH).parent / "markets_state.json"
+    if not markets_file.exists():
+        return {"markets": []}
+    try:
+        data = json.loads(markets_file.read_text())
+        return {"markets": data.get("active_windows", [])}
+    except Exception:
+        return {"markets": []}
+
+
+@app.get("/report")
+def report(period: str = "hour", authorization: str = Header(None)):
+    """Hourly/periodic trade report with full stats."""
+    check_auth(authorization)
+    from data.trade_logger import TradeLogger
+    trade_log = TradeLogger()
+    if period == "hour":
+        return trade_log.get_hourly_report(hours=1)
+    elif period == "session":
+        return trade_log.get_session_summary()
+    elif period == "daily":
+        return {"daily_summaries": trade_log.get_daily_summaries(days=7)}
+    else:
+        return trade_log.get_hourly_report(hours=1)
+
+
+@app.get("/trade_log")
+def trade_log(limit: int = 20, authorization: str = Header(None)):
+    """Recent trades from the database."""
+    check_auth(authorization)
+    from data.trade_logger import TradeLogger
+    trade_log = TradeLogger()
+    return {"trades": trade_log.get_recent_trades(limit=min(limit, 100))}
+
+
+@app.post("/backup")
+def backup(authorization: str = Header(None)):
+    """Trigger a manual database backup."""
+    check_auth(authorization)
+    from data.trade_logger import TradeLogger
+    trade_log = TradeLogger()
+    try:
+        path = trade_log.backup()
+        return {"ok": True, "backup_path": path}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Backup failed: {e}")
 
 
 @app.post("/halt")

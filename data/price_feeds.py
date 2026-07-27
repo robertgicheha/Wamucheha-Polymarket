@@ -17,6 +17,7 @@ from connectors.okx_connector import OKXConnector
 logger = logging.getLogger(__name__)
 
 # Map Polymarket crypto market keywords to exchange symbols
+# Includes Gold (XAU) as a crypto-adjacent commodity tracked on prediction markets
 CRYPTO_SYMBOL_MAP = {
     "bitcoin": {"binance": "BTCUSDT", "okx": "BTC-USDT", "okx_swap": "BTC-USDT-SWAP"},
     "btc": {"binance": "BTCUSDT", "okx": "BTC-USDT", "okx_swap": "BTC-USDT-SWAP"},
@@ -25,8 +26,11 @@ CRYPTO_SYMBOL_MAP = {
     "solana": {"binance": "SOLUSDT", "okx": "SOL-USDT", "okx_swap": "SOL-USDT-SWAP"},
     "sol": {"binance": "SOLUSDT", "okx": "SOL-USDT", "okx_swap": "SOL-USDT-SWAP"},
     "xrp": {"binance": "XRPUSDT", "okx": "XRP-USDT", "okx_swap": "XRP-USDT-SWAP"},
+    "ripple": {"binance": "XRPUSDT", "okx": "XRP-USDT", "okx_swap": "XRP-USDT-SWAP"},
     "dogecoin": {"binance": "DOGEUSDT", "okx": "DOGE-USDT", "okx_swap": "DOGE-USDT-SWAP"},
     "doge": {"binance": "DOGEUSDT", "okx": "DOGE-USDT", "okx_swap": "DOGE-USDT-SWAP"},
+    "gold": {"binance": "PAXGUSDT", "okx": "PAXG-USDT", "okx_swap": "PAXG-USDT-SWAP"},
+    "xau": {"binance": "PAXGUSDT", "okx": "PAXG-USDT", "okx_swap": "PAXG-USDT-SWAP"},
 }
 
 
