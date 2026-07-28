@@ -11,3 +11,5 @@ models/*.pt
 models/*.pkl
 models/*.txt
 .env
+data/pm_trader/
+data/paper_ledger_state.json

@@ -141,7 +141,7 @@ def _run_async(coro):
         loop.close()
 
 
-def _write_balance_state(risk_manager, arb_engine=None, lifecycle_engine=None):
+def _write_balance_state(risk_manager, arb_engine=None, lifecycle_engine=None, paper_broker=None):
     """Write current balance state to JSON for admin API reads."""
     summary = risk_manager.get_compounding_summary()
     state = {
@@ -164,6 +164,12 @@ def _write_balance_state(risk_manager, arb_engine=None, lifecycle_engine=None):
     if lifecycle_engine:
         state["lifecycle_active_markets"] = len(lifecycle_engine.get_active_windows())
         state["lifecycle_total_pnl"] = lifecycle_engine.get_total_pnl()
+    if paper_broker:
+        paper_summary = paper_broker.summary()
+        state["paper_balance"] = paper_summary.get("balance", 0.0)
+        state["paper_positions"] = paper_summary.get("open_positions", {})
+        state["paper_trades"] = paper_summary.get("total_trades", 0)
+        state["paper_fees"] = paper_summary.get("total_fees", 0.0)
     balance_path = Path(os.environ.get("BOT_DB_PATH", "data")) / "balance.json"
     balance_path.parent.mkdir(parents=True, exist_ok=True)
     balance_path.write_text(json.dumps(state, indent=2))
@@ -227,11 +233,41 @@ def main():
         ws_connector = _init_websocket_connector()
         logger.info("Polymarket WebSocket connector initialized")
 
-    # ── Paper broker ──────────────────────────────────────────────────
+    # ── Paper broker (gated by TRAINING_MODE) ─────────────────────────
     paper_broker = None
-    if settings.trading_mode == "paper":
-        from backtest.paper_broker import PaperBroker
-        paper_broker = PaperBroker(risk_manager)
+    if settings.training_mode and settings.trading_mode == "paper":
+        if settings.paper_backend == "pm_trader":
+            try:
+                from backtest.pm_trader_bridge import PMTraderBroker
+                paper_broker = PMTraderBroker(
+                    risk_manager,
+                    data_dir=settings.pm_trader_data_dir,
+                    starting_balance=settings.pm_trader_starting_balance,
+                )
+                logger.info("Paper broker: pm_trader backend (data_dir=%s)", settings.pm_trader_data_dir)
+            except ImportError:
+                logger.warning(
+                    "polymarket-paper-trader not installed, falling back to local PaperLedger. "
+                    "Install with: pip install polymarket-paper-trader"
+                )
+                from backtest.paper_broker import PaperBroker
+                paper_broker = PaperBroker(
+                    risk_manager,
+                    state_file=settings.paper_ledger_state_file,
+                    starting_balance=settings.initial_stake_usd,
+                    fee_bps=settings.paper_fee_bps,
+                )
+        else:
+            from backtest.paper_broker import PaperBroker
+            paper_broker = PaperBroker(
+                risk_manager,
+                state_file=settings.paper_ledger_state_file,
+                starting_balance=settings.initial_stake_usd,
+                fee_bps=settings.paper_fee_bps,
+            )
+            logger.info("Paper broker: local PaperLedger backend")
+    elif not settings.training_mode:
+        logger.info("TRAINING_MODE=false — paper trading disabled, preparing for live trading")
 
     # ── Start BRTI engine ─────────────────────────────────────────────
     async def _start_brti():
@@ -279,10 +315,11 @@ def main():
     # ── Startup notification ──────────────────────────────────────────
     startup_msg = (
         f"Bot started in {settings.trading_mode.upper()} mode\n"
+        f"Training Mode: {'ON (paper trading active)' if settings.training_mode else 'OFF (preparing for live)'}\n"
         f"Principal: ${risk_manager.principal:.2f}\n"
         f"BRTI exchanges: {settings.brti_exchanges}\n"
         f"Strategies: {list(strategies.keys())}\n"
-        f"Arb min spread: {settings.arb_min_spread_cents}¢\n"
+        f"Arb min spread: {settings.arb_min_spread_cents}\u00a2\n"
         f"Compounding: {'ON' if settings.compound_enabled else 'OFF'}"
     )
     if settings.lifecycle_engine_enabled:
@@ -365,7 +402,7 @@ def main():
                     )
 
                     # Execute via Gnosis Safe relayer if enabled
-                    if gnosis_relayer and settings.trading_mode == "live":
+                    if gnosis_relayer and settings.trading_mode == "live" and not settings.training_mode:
                         try:
                             success = _run_async(gnosis_relayer.submit_order(
                                 market_id=contract.ticker,
@@ -381,7 +418,7 @@ def main():
                                 )
                         except Exception as e:
                             logger.error("Gnosis relayer failed, falling back to direct: %s", e)
-                    elif settings.trading_mode == "paper" and paper_broker:
+                    elif settings.training_mode and paper_broker:
                         fill = paper_broker.simulate_order(
                             market_id=contract.ticker,
                             category=category,
@@ -408,8 +445,8 @@ def main():
                             },
                         )
 
-                        notifier.send(
-                            f"[PAPER] {decision.side} {contract.ticker} "
+                        notifier.send_training(
+                            f"[TRAINING] {decision.side} {contract.ticker} "
                             f"@ {fill.filled_price:.3f} (${size_usd:.2f}) — "
                             f"edge={decision.edge:+.4f} | "
                             f"Bankroll: ${risk_manager.bankroll:.2f}\n"
@@ -487,7 +524,7 @@ def main():
 
             # ── 11. Write state files for admin API ───────────────────
             if cycle_count % 10 == 0:
-                _write_balance_state(risk_manager, arb_engine, lifecycle_engine)
+                _write_balance_state(risk_manager, arb_engine, lifecycle_engine, paper_broker)
                 if lifecycle_engine:
                     _write_markets_state(lifecycle_engine)
 
@@ -501,8 +538,10 @@ def main():
 
             # ── 12. Dashboard state update ────────────────────────────
             try:
-                from dashboard.state import update_state
+                from dashboard.state import update_state, update_paper_state
                 update_state(risk_manager)
+                if paper_broker:
+                    update_paper_state(paper_broker)
             except Exception:
                 pass
 

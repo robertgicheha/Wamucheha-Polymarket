@@ -46,6 +46,7 @@ def _list_str(key: str, default: List[str]) -> List[str]:
 @dataclass
 class Settings:
     trading_mode: str = os.getenv("TRADING_MODE", "paper")
+    training_mode: bool = _bool("TRAINING_MODE", True)
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
 
     # Polymarket
@@ -125,6 +126,13 @@ class Settings:
 
     # Trading strategy
     strategy: str = os.getenv("STRATEGY", "kelly")
+
+    # Paper trading (PaperLedger)
+    paper_backend: str = os.getenv("PAPER_BACKEND", "pm_trader")  # "pm_trader" | "local"
+    paper_ledger_state_file: str = os.getenv("PAPER_LEDGER_STATE_FILE", "data/paper_ledger_state.json")
+    paper_fee_bps: float = _float("PAPER_FEE_BPS", 200.0)
+    pm_trader_data_dir: str = os.getenv("PM_TRADER_DATA_DIR", "data/pm_trader")
+    pm_trader_starting_balance: float = _float("PM_TRADER_STARTING_BALANCE", 10000.0)
 
     # ML / AI
     ml_model_dir: str = os.getenv("ML_MODEL_DIR", "models")
