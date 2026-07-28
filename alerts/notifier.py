@@ -26,6 +26,13 @@ class Notifier:
         if severity == Severity.CRITICAL:
             self._send_email(message)
 
+    def send_training(self, message: str, severity: Severity = Severity.INFO) -> None:
+        """Send training mode notifications. Suppressed when TRAINING_MODE=false."""
+        if not settings.training_mode:
+            return
+        self._send_telegram(message, severity)
+        self._send_discord(message, severity)
+
     def _send_telegram(self, message: str, severity: Severity) -> None:
         if not settings.telegram_bot_token or not settings.telegram_chat_id:
             return

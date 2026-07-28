@@ -193,7 +193,7 @@ async def arb_cmd(interaction: discord.Interaction):
         f"Open Positions: {d.get('open_positions', 0)}\n"
         f"Total PnL: ${d.get('total_pnl', 0):.4f}\n"
         f"Win Rate: {d.get('win_rate', 0):.1f}%\n"
-        f"PM Markets: {d.get('pm_markets_tracked', 0)} | Kalshi: {d.get('kalshi_contracts_tracked', 0)}"
+        f"PM Markets: {d.get('pm_markets_tracked', 0)}"
     )
 
 

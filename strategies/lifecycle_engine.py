@@ -451,21 +451,25 @@ class FiveMinuteLifecycleEngine:
                 self.on_pnl(trade_record)
 
             if self.on_notification:
-                emoji = "W" if window.won else "L"
                 self.on_notification(
-                    f"[{emoji}] {window.asset.upper()} {window.position_side} | "
-                    f"PnL: ${window.pnl_usd:+.4f} | "
-                    f"Bankroll: ${self.bankroll:.2f} | "
-                    f"Win Rate: {self._stats.win_rate:.1f}%"
+                    f"[NL-PAPER] \u26a0\ufe0f Inflight bet recovered\n"
+                    f"Market: {condition_id}\n"
+                    f"Side: {window.position_side} | PM: {window.position_side} | "
+                    f"{'WIN' if window.won else 'LOSS'} | "
+                    f"pnl=${window.pnl_usd:+.2f}\n"
+                    f"Bankroll: ${self.bankroll:.2f}\n"
+                    f"Gas fee: ${fee:.4f}"
                 )
 
             logger.info(
-                "Market END: %s %s %s | Entry: %.3f Exit: %.3f | "
-                "PnL: $%.4f (%s) | Bankroll: $%.2f",
-                condition_id[:8], window.asset.upper(), window.position_side,
-                window.entry_price, window.exit_price,
-                window.pnl_usd, "WIN" if window.won else "LOSS",
-                self.bankroll,
+                "[NL-PAPER] \u26a0\ufe0f Inflight bet recovered\n"
+                "Market: %s\n"
+                "Side: %s | PM: %s | %s | pnl=$%+.2f\n"
+                "Bankroll: $%.2f\n"
+                "Gas fee: $%.4f",
+                condition_id, window.asset.upper(), window.position_side,
+                "WIN" if window.won else "LOSS",
+                window.pnl_usd, self.bankroll, fee,
             )
 
         window.phase = MarketPhase.SETTLED

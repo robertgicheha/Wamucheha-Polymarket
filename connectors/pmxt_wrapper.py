@@ -1,15 +1,8 @@
 """
-PMXT Integration — unified API wrapper for Polymarket + Kalshi.
-
-PMXT (github.com/pmxt-dev/pmxt) provides a single interface to:
-  - Query markets across both platforms
-  - Place orders on either platform
-  - Read orderbooks
-  - Track positions
+PMXT Integration — unified API wrapper for Polymarket.
 
 This wrapper adds:
-  - Price normalization across platforms
-  - Cross-platform market matching
+  - Price normalization
   - Unified order interface with slippage modeling
   - Paper trading mode
 
@@ -39,8 +32,8 @@ except ImportError:
 
 @dataclass
 class UnifiedMarket:
-    """Normalized market representation across platforms."""
-    platform: str  # "polymarket" or "kalshi"
+    """Normalized market representation."""
+    platform: str  # "polymarket", "limit_exchange", "opinion", "myriad"
     market_id: str
     question: str
     category: str
@@ -103,7 +96,7 @@ class UnifiedFill:
 
 class PMXTWrapper:
     """
-    Unified wrapper for Polymarket + Kalshi via PMXT.
+    Unified wrapper for Polymarket.
 
     Provides a single interface for:
     - Market discovery and querying
@@ -123,7 +116,7 @@ class PMXTWrapper:
         self.slippage_pct = slippage_pct
         self._pmxt_client = None
         self._pm_connector = None
-        self._kalshi_client = None
+        # self._kalshi_client = None
 
         self._init_connectors()
 
@@ -160,16 +153,11 @@ class PMXTWrapper:
     # ── Market Discovery ───────────────────────────────────────────────
 
     async def get_crypto_markets(self) -> List[UnifiedMarket]:
-        """Get all active crypto prediction markets from both platforms."""
+        """Get all active crypto prediction markets."""
         markets = []
 
-        # Polymarket
         pm_markets = await self._get_pm_markets()
         markets.extend(pm_markets)
-
-        # Kalshi
-        kalshi_markets = await self._get_kalshi_markets()
-        markets.extend(kalshi_markets)
 
         return markets
 
@@ -216,52 +204,17 @@ class PMXTWrapper:
             logger.error("Failed to get PM markets: %s", e)
             return []
 
-    async def _get_kalshi_markets(self) -> List[UnifiedMarket]:
-        """Get Kalshi crypto markets."""
-        if self._pmxt_client:
-            return await self._pmxt_get_kalshi_markets()
-        return await self._native_kalshi_markets()
-
-    async def _native_kalshi_markets(self) -> List[UnifiedMarket]:
-        """Get Kalshi markets using native API."""
-        try:
-            import requests
-            resp = requests.get(
-                f"{settings.kalshi_api_base}/markets",
-                params={"series_ticker": "BTC", "limit": 100},
-                headers={"Authorization": f"Bearer {settings.kalshi_api_key}"},
-                timeout=10,
-            )
-            if resp.status_code != 200:
-                return []
-
-            markets = []
-            for item in resp.json().get("markets", []):
-                markets.append(UnifiedMarket(
-                    platform="kalshi",
-                    market_id=item.get("ticker", ""),
-                    question=item.get("title", ""),
-                    category="crypto",
-                    yes_price=float(item.get("yes_ask", 50)) / 100,
-                    no_price=float(item.get("no_ask", 50)) / 100,
-                    volume_24h=float(item.get("volume", 0)),
-                    end_date=item.get("close_time", ""),
-                    active=item.get("status", "") == "open",
-                ))
-            return markets
-        except Exception as e:
-            logger.error("Failed to get Kalshi markets: %s", e)
-            return []
-
     async def _pmxt_get_pm_markets(self) -> List[UnifiedMarket]:
         """Get PM markets via PMXT."""
-        # Placeholder for PMXT API call
         return []
 
-    async def _pmxt_get_kalshi_markets(self) -> List[UnifiedMarket]:
-        """Get Kalshi markets via PMXT."""
-        # Placeholder for PMXT API call
-        return []
+    # # Kalshi market fetching (commented out)
+    # async def _get_kalshi_markets(self) -> List[UnifiedMarket]:
+    #     ...
+    # async def _native_kalshi_markets(self) -> List[UnifiedMarket]:
+    #     ...
+    # async def _pmxt_get_kalshi_markets(self) -> List[UnifiedMarket]:
+    #     ...
 
     # ── Price Feeds ────────────────────────────────────────────────────
 
@@ -269,8 +222,6 @@ class PMXTWrapper:
         """Get (yes_price, no_price) for a market."""
         if platform == "polymarket":
             return await self._get_pm_price(market_id)
-        elif platform == "kalshi":
-            return await self._get_kalshi_price(market_id)
         return None
 
     async def _get_pm_price(self, market_id: str) -> Optional[Tuple[float, float]]:
@@ -296,24 +247,9 @@ class PMXTWrapper:
             logger.error("PM price fetch failed: %s", e)
         return None
 
-    async def _get_kalshi_price(self, market_id: str) -> Optional[Tuple[float, float]]:
-        """Get Kalshi price."""
-        try:
-            import requests
-            resp = requests.get(
-                f"{settings.kalshi_api_base}/markets/{market_id}",
-                headers={"Authorization": f"Bearer {settings.kalshi_api_key}"},
-                timeout=5,
-            )
-            if resp.status_code != 200:
-                return None
-            data = resp.json().get("market", {})
-            yes_price = float(data.get("yes_bid", 50)) / 100
-            no_price = float(data.get("no_bid", 50)) / 100
-            return (yes_price, no_price)
-        except Exception as e:
-            logger.error("Kalshi price fetch failed: %s", e)
-        return None
+    # async def _get_kalshi_price(self, market_id: str) -> Optional[Tuple[float, float]]:
+    #     """Get Kalshi price."""
+    #     ...
 
     # ── Order Execution ────────────────────────────────────────────────
 
@@ -324,8 +260,6 @@ class PMXTWrapper:
 
         if order.platform == "polymarket":
             return await self._place_pm_order(order)
-        elif order.platform == "kalshi":
-            return await self._place_kalshi_order(order)
         return None
 
     def _simulate_fill(self, order: UnifiedOrder) -> UnifiedFill:
@@ -377,73 +311,21 @@ class PMXTWrapper:
             logger.error("PM order failed: %s", e)
         return None
 
-    async def _place_kalshi_order(self, order: UnifiedOrder) -> Optional[UnifiedFill]:
-        """Place order on Kalshi."""
-        try:
-            if self._pmxt_client:
-                return await self._pmxt_place_kalshi_order(order)
-            # Native Kalshi order placement
-            import requests
-            payload = {
-                "ticker": order.market_id,
-                "action": "buy" if order.side == "YES" else "sell",
-                "type": "limit" if order.order_type == "limit" else "market",
-                "count": int(order.size_usd / order.price) if order.price > 0 else 0,
-                "price": int(order.price * 100),  # Kalshi uses cents
-            }
-            resp = requests.post(
-                f"{settings.kalshi_api_base}/portfolio/orders",
-                json=payload,
-                headers={"Authorization": f"Bearer {settings.kalshi_api_key}"},
-                timeout=10,
-            )
-            if resp.status_code in (200, 201):
-                data = resp.json().get("order", {})
-                return UnifiedFill(
-                    platform="kalshi",
-                    market_id=order.market_id,
-                    side=order.side,
-                    requested_price=order.price,
-                    filled_price=float(data.get("price", order.price)) / 100,
-                    size_usd=order.size_usd,
-                    fee_usd=0.0,
-                    order_id=data.get("order_id", ""),
-                    timestamp=time.time(),
-                )
-        except Exception as e:
-            logger.error("Kalshi order failed: %s", e)
-        return None
+    # async def _place_kalshi_order(self, order: UnifiedOrder) -> Optional[UnifiedFill]:
+    #     """Place order on Kalshi."""
+    #     ...
 
     async def _pmxt_place_pm_order(self, order: UnifiedOrder) -> Optional[UnifiedFill]:
         """Place PM order via PMXT."""
         # Placeholder
         return None
 
-    async def _pmxt_place_kalshi_order(self, order: UnifiedOrder) -> Optional[UnifiedFill]:
-        """Place Kalshi order via PMXT."""
-        # Placeholder
-        return None
+    # async def _pmxt_place_kalshi_order(self, order: UnifiedOrder) -> Optional[UnifiedFill]:
+    #     """Place Kalshi order via PMXT."""
+    #     return None
 
     # ── Cross-Platform Matching ────────────────────────────────────────
 
-    def find_arb_markets(self, pm_markets: List[UnifiedMarket], kalshi_markets: List[UnifiedMarket]) -> List[Dict]:
-        """
-        Match Polymarket and Kalshi markets for arbitrage.
-
-        Returns list of matched market pairs:
-        [{"pm_market": ..., "kalshi_market": ..., "similarity": float}]
-        """
-        matches = []
-        for pm in pm_markets:
-            pm_words = set(pm.question.lower().split())
-            for kalshi in kalshi_markets:
-                kalshi_words = set(kalshi.question.lower().split())
-                overlap = len(pm_words & kalshi_words)
-                total = len(pm_words | kalshi_words)
-                if total > 0 and overlap / total > 0.3:
-                    matches.append({
-                        "pm_market": pm,
-                        "kalshi_market": kalshi,
-                        "similarity": overlap / total,
-                    })
-        return matches
+    # def find_arb_markets(self, pm_markets: List[UnifiedMarket], ...) -> List[Dict]:
+    #     """Match Polymarket with alt platforms for arbitrage."""
+    #     ...

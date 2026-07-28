@@ -5,22 +5,21 @@ Modules integrated:
   - BRTI Engine: real-time BTC price replication from exchange orderbooks
   - TTE Orchestrator: 900 ML models for time-to-expiry prediction
   - Strategy Engine: 6 strategies, selected by Sharpe/P&L
-  - Arbitrage Engine: cross-platform PM+Kalshi + orderbook-based intra-platform arb
-  - PMXT Wrapper: unified Polymarket+Kalshi API
+  - Arbitrage Engine: cross-platform PM + Limit Exchange / Opinion / Myriad
+  - PMXT Wrapper: unified Polymarket API
   - Risk Manager: circuit breaker, stop-loss, compounding
   - WebSocket Engine: real-time Polymarket orderbook/trade feeds
   - Lifecycle Engine: 5-minute market lifecycle management
-  - Gnosis Safe Relayer: gasless payments via Polymarket relayer
 
 Cycle flow:
   1. BRTI engine ticks (1-sec) → feeds TTE models
   2. TTE models predict at each TTE → probability + confidence
   3. Strategy engine selects best strategy → trade decision
-  4. Arbitrage engine scans for PM+Kalshi spreads → arb opportunities
+  4. Arbitrage engine scans for cross-platform spreads
   5. Orderbook arb scans 5-min markets for complement spreads
   6. Lifecycle engine manages 5-min market windows
   7. Risk checks → position sizing, circuit breaker
-  8. Execute trades via Gnosis Safe relayer (gasless) or paper broker
+  8. Execute trades via paper broker
   9. Monitor positions, check exits
   10. Dashboard update, alerts
 """
@@ -117,19 +116,19 @@ def _init_lifecycle_engine(arb_engine, orderbook_arb, risk_manager, trade_logger
     )
 
 
-def _init_gnosis_relayer():
-    """Initialize Gnosis Safe relayer for gasless payments."""
-    if not settings.gnosis_safe_enabled:
-        return None
-    from connectors.gnosis_relayer import GnosisSafeRelayer, RelayerConfig
-    config = RelayerConfig(
-        safe_address=settings.gnosis_safe_address,
-        private_key=settings.gnosis_safe_owner_key,
-        rpc_url=settings.polygon_rpc_url or "https://polygon-rpc.com",
-        relayer_url="https://safe-relayer.gnosis.io",
-        chain_id=137,
-    )
-    return GnosisSafeRelayer(config)
+# def _init_gnosis_relayer():
+#     """Initialize Gnosis Safe relayer for gasless payments."""
+#     if not settings.gnosis_safe_enabled:
+#         return None
+#     from connectors.gnosis_relayer import GnosisSafeRelayer, RelayerConfig
+#     config = RelayerConfig(
+#         safe_address=settings.gnosis_safe_address,
+#         private_key=settings.gnosis_safe_owner_key,
+#         rpc_url=settings.polygon_rpc_url or "https://polygon-rpc.com",
+#         relayer_url="https://safe-relayer.gnosis.io",
+#         chain_id=137,
+#     )
+#     return GnosisSafeRelayer(config)
 
 
 def _run_async(coro):
@@ -141,7 +140,7 @@ def _run_async(coro):
         loop.close()
 
 
-def _write_balance_state(risk_manager, arb_engine=None, lifecycle_engine=None):
+def _write_balance_state(risk_manager, arb_engine=None, lifecycle_engine=None, paper_broker=None):
     """Write current balance state to JSON for admin API reads."""
     summary = risk_manager.get_compounding_summary()
     state = {
@@ -164,6 +163,12 @@ def _write_balance_state(risk_manager, arb_engine=None, lifecycle_engine=None):
     if lifecycle_engine:
         state["lifecycle_active_markets"] = len(lifecycle_engine.get_active_windows())
         state["lifecycle_total_pnl"] = lifecycle_engine.get_total_pnl()
+    if paper_broker:
+        paper_summary = paper_broker.summary()
+        state["paper_balance"] = paper_summary.get("balance", 0.0)
+        state["paper_positions"] = paper_summary.get("open_positions", {})
+        state["paper_trades"] = paper_summary.get("total_trades", 0)
+        state["paper_fees"] = paper_summary.get("total_fees", 0.0)
     balance_path = Path(os.environ.get("BOT_DB_PATH", "data")) / "balance.json"
     balance_path.parent.mkdir(parents=True, exist_ok=True)
     balance_path.write_text(json.dumps(state, indent=2))
@@ -186,7 +191,7 @@ def main():
     logger.info("Polymarket Crypto Trading Bot starting...")
     logger.info("Mode: %s | Categories: %s", settings.trading_mode, settings.categories_enabled)
     logger.info("Lifecycle engine: %s", "enabled" if settings.lifecycle_engine_enabled else "disabled")
-    logger.info("Gnosis Safe relayer: %s", "enabled" if settings.gnosis_safe_enabled else "disabled")
+    # logger.info("Gnosis Safe relayer: %s", "enabled" if settings.gnosis_safe_enabled else "disabled")
     logger.info("Compounding: %s", "enabled" if settings.compound_enabled else "disabled")
     logger.info("=" * 60)
 
@@ -211,11 +216,11 @@ def main():
     ws_connector = None
     lifecycle_engine = None
 
-    from data.brti.kalshi_settlement import KalshiSettlementCalculator
-    settlement_calc = KalshiSettlementCalculator()
-
-    # Connect BRTI ticks to settlement calculator
-    brti_engine.on_tick(settlement_calc.on_brti_tick)
+    # # Kalshi settlement calculator (commented out)
+    # from data.brti.kalshi_settlement import KalshiSettlementCalculator
+    # settlement_calc = KalshiSettlementCalculator()
+    # brti_engine.on_tick(settlement_calc.on_brti_tick)
+    settlement_calc = None
 
     # ── Initialize lifecycle engine (5-min markets) ───────────────────
     if settings.lifecycle_engine_enabled:
@@ -227,11 +232,41 @@ def main():
         ws_connector = _init_websocket_connector()
         logger.info("Polymarket WebSocket connector initialized")
 
-    # ── Paper broker ──────────────────────────────────────────────────
+    # ── Paper broker (gated by TRAINING_MODE) ─────────────────────────
     paper_broker = None
-    if settings.trading_mode == "paper":
-        from backtest.paper_broker import PaperBroker
-        paper_broker = PaperBroker(risk_manager)
+    if settings.training_mode and settings.trading_mode == "paper":
+        if settings.paper_backend == "pm_trader":
+            try:
+                from backtest.pm_trader_bridge import PMTraderBroker
+                paper_broker = PMTraderBroker(
+                    risk_manager,
+                    data_dir=settings.pm_trader_data_dir,
+                    starting_balance=settings.pm_trader_starting_balance,
+                )
+                logger.info("Paper broker: pm_trader backend (data_dir=%s)", settings.pm_trader_data_dir)
+            except ImportError:
+                logger.warning(
+                    "polymarket-paper-trader not installed, falling back to local PaperLedger. "
+                    "Install with: pip install polymarket-paper-trader"
+                )
+                from backtest.paper_broker import PaperBroker
+                paper_broker = PaperBroker(
+                    risk_manager,
+                    state_file=settings.paper_ledger_state_file,
+                    starting_balance=settings.initial_stake_usd,
+                    fee_bps=settings.paper_fee_bps,
+                )
+        else:
+            from backtest.paper_broker import PaperBroker
+            paper_broker = PaperBroker(
+                risk_manager,
+                state_file=settings.paper_ledger_state_file,
+                starting_balance=settings.initial_stake_usd,
+                fee_bps=settings.paper_fee_bps,
+            )
+            logger.info("Paper broker: local PaperLedger backend")
+    elif not settings.training_mode:
+        logger.info("TRAINING_MODE=false — paper trading disabled, preparing for live trading")
 
     # ── Start BRTI engine ─────────────────────────────────────────────
     async def _start_brti():
@@ -279,16 +314,17 @@ def main():
     # ── Startup notification ──────────────────────────────────────────
     startup_msg = (
         f"Bot started in {settings.trading_mode.upper()} mode\n"
+        f"Training Mode: {'ON (paper trading active)' if settings.training_mode else 'OFF (preparing for live)'}\n"
         f"Principal: ${risk_manager.principal:.2f}\n"
         f"BRTI exchanges: {settings.brti_exchanges}\n"
         f"Strategies: {list(strategies.keys())}\n"
-        f"Arb min spread: {settings.arb_min_spread_cents}¢\n"
+        f"Arb min spread: {settings.arb_min_spread_cents}\u00a2\n"
         f"Compounding: {'ON' if settings.compound_enabled else 'OFF'}"
     )
     if settings.lifecycle_engine_enabled:
         startup_msg += "\n5-min lifecycle engine: ENABLED"
-    if settings.gnosis_safe_enabled:
-        startup_msg += "\nGnosis Safe relayer: ENABLED"
+    # if settings.gnosis_safe_enabled:
+    #     startup_msg += "\nGnosis Safe relayer: ENABLED"
     notifier.send(startup_msg, Severity.INFO)
 
     # ── Main loop ─────────────────────────────────────────────────────
@@ -315,115 +351,98 @@ def main():
             # ── 2. Update external price feeds for orderbook arb ──────
             orderbook_arb.update_external_price("BTC", current_btc_price)
 
-            # ── 3. Get current TTE for active contracts ───────────────
-            active_contracts = settlement_calc.get_active_contracts()
-            for contract in active_contracts:
-                tte = int(contract.time_to_close_seconds)
-                if tte <= 0 or tte > 900:
-                    continue
-
-                import pandas as pd
-                import numpy as np
-                features = pd.DataFrame(
-                    np.random.randn(1, 80),
-                    columns=[f"f{i}" for i in range(80)],
-                )
-
-                prediction = tte_orchestrator.predict(features, tte)
-
-                # ── 4. Strategy selection (periodic) ──────────────────
-                if cycle_count - last_strategy_eval >= 3600:
-                    best_strategy_name = settings.strategy
-                    last_strategy_eval = cycle_count
-
-                strategy = strategies.get(best_strategy_name)
-                if strategy is None:
-                    continue
-
-                # ── 5. Trade decision ─────────────────────────────────
-                decision = strategy.should_trade(
-                    model_prob=prediction["probability"],
-                    market_price=contract.last_yes_price or 0.5,
-                    bankroll=risk_manager.bankroll,
-                    tte_seconds=tte,
-                    volatility=brti_engine.get_volatility(60) or 0.01,
-                    extra={
-                        "momentum": 0.0,
-                        "z_score": 0.0,
-                        "confidence": prediction.get("confidence", 0.5),
-                    },
-                )
-
-                if decision.should_trade and decision.size_usd > 0:
-                    if not risk_manager.can_open_new_position():
+            # ── 3-5. Trade decision (strategy-based, lifecycle engine handles its own) ──
+            if settlement_calc is not None:
+                active_contracts = settlement_calc.get_active_contracts()
+                for contract in active_contracts:
+                    tte = int(contract.time_to_close_seconds)
+                    if tte <= 0 or tte > 900:
                         continue
 
-                    category = "crypto"
-                    size_usd = min(
-                        decision.size_usd,
-                        risk_manager.max_position_size(category),
+                    import pandas as pd
+                    import numpy as np
+                    features = pd.DataFrame(
+                        np.random.randn(1, 80),
+                        columns=[f"f{i}" for i in range(80)],
                     )
 
-                    # Execute via Gnosis Safe relayer if enabled
-                    if gnosis_relayer and settings.trading_mode == "live":
-                        try:
-                            success = _run_async(gnosis_relayer.submit_order(
+                    prediction = tte_orchestrator.predict(features, tte)
+
+                    if cycle_count - last_strategy_eval >= 3600:
+                        best_strategy_name = settings.strategy
+                        last_strategy_eval = cycle_count
+
+                    strategy = strategies.get(best_strategy_name)
+                    if strategy is None:
+                        continue
+
+                    decision = strategy.should_trade(
+                        model_prob=prediction["probability"],
+                        market_price=contract.last_yes_price or 0.5,
+                        bankroll=risk_manager.bankroll,
+                        tte_seconds=tte,
+                        volatility=brti_engine.get_volatility(60) or 0.01,
+                        extra={
+                            "momentum": 0.0,
+                            "z_score": 0.0,
+                            "confidence": prediction.get("confidence", 0.5),
+                        },
+                    )
+
+                    if decision.should_trade and decision.size_usd > 0:
+                        if not risk_manager.can_open_new_position():
+                            continue
+
+                        category = "crypto"
+                        size_usd = min(
+                            decision.size_usd,
+                            risk_manager.max_position_size(category),
+                        )
+
+                        if settings.training_mode and paper_broker:
+                            fill = paper_broker.simulate_order(
                                 market_id=contract.ticker,
+                                category=category,
                                 side=decision.side,
                                 price=contract.last_yes_price or 0.5,
+                            )
+
+                            trade_id = trade_logger.log_entry(
+                                condition_id=contract.ticker,
+                                asset="btc",
+                                side=decision.side,
+                                price=fill.filled_price,
                                 size_usd=size_usd,
-                            ))
-                            if success:
-                                notifier.send(
-                                    f"[GASLESS] {decision.side} {contract.ticker} "
-                                    f"@ {contract.last_yes_price:.3f} (${size_usd:.2f})",
-                                    Severity.INFO,
-                                )
-                        except Exception as e:
-                            logger.error("Gnosis relayer failed, falling back to direct: %s", e)
-                    elif settings.trading_mode == "paper" and paper_broker:
-                        fill = paper_broker.simulate_order(
-                            market_id=contract.ticker,
-                            category=category,
-                            side=decision.side,
-                            price=contract.last_yes_price or 0.5,
-                        )
+                                strategy=best_strategy_name,
+                                source="lifecycle",
+                                market_question=getattr(contract, 'question', ''),
+                                bankroll_after=risk_manager.bankroll,
+                                metadata={
+                                    "edge": decision.edge,
+                                    "model_prob": prediction["probability"],
+                                    "market_price": contract.last_yes_price or 0.5,
+                                    "tte": tte,
+                                },
+                            )
 
-                        # Log trade entry
-                        trade_id = trade_logger.log_entry(
-                            condition_id=contract.ticker,
-                            asset="btc",
-                            side=decision.side,
-                            price=fill.filled_price,
-                            size_usd=size_usd,
-                            strategy=best_strategy_name,
-                            source="lifecycle",
-                            market_question=getattr(contract, 'question', ''),
-                            bankroll_after=risk_manager.bankroll,
-                            metadata={
-                                "edge": decision.edge,
-                                "model_prob": prediction["probability"],
-                                "market_price": contract.last_yes_price or 0.5,
-                                "tte": tte,
-                            },
-                        )
+                            notifier.send_training(
+                                f"[NL-PAPER] \u26a0\ufe0f Inflight bet recovered\n"
+                                f"Market: {contract.ticker}\n"
+                                f"Side: {decision.side} | PM: {decision.side} | "
+                                f"edge={decision.edge:+.4f}\n"
+                                f"Bankroll: ${risk_manager.bankroll:.2f}\n"
+                                f"Trade ID: {trade_id}",
+                                Severity.INFO,
+                            )
 
-                        notifier.send(
-                            f"[PAPER] {decision.side} {contract.ticker} "
-                            f"@ {fill.filled_price:.3f} (${size_usd:.2f}) — "
-                            f"edge={decision.edge:+.4f} | "
-                            f"Bankroll: ${risk_manager.bankroll:.2f}\n"
-                            f"Trade ID: {trade_id}",
-                            Severity.INFO,
+                        logger.info(
+                            "[NL-PAPER] \u26a0\ufe0f Inflight bet recovered\n"
+                            "Market: %s\n"
+                            "Side: %s | PM: %s | edge=%+.4f\n"
+                            "Bankroll: $%.2f",
+                            contract.ticker, decision.side, decision.side,
+                            decision.edge, risk_manager.bankroll,
                         )
-
-                    logger.info(
-                        "Trade: %s %s — prob=%.3f market=%.3f edge=%+.4f size=$%.2f",
-                        decision.side, contract.ticker,
-                        prediction["probability"],
-                        contract.last_yes_price or 0.5,
-                        decision.edge, size_usd,
-                    )
 
             # ── 6. Cross-platform arbitrage scan ──────────────────────
             pm_markets = _run_async(pmxt.get_crypto_markets())
@@ -436,8 +455,22 @@ def main():
                         question=market.question,
                         volume_24h=market.volume_24h,
                     )
-                elif market.platform == "kalshi":
-                    arb_engine.update_kalshi_prices(
+                elif market.platform == "limit_exchange":
+                    arb_engine.update_limit_exchange_prices(
+                        market.market_id,
+                        market.yes_price,
+                        market.no_price,
+                        question=market.question,
+                    )
+                elif market.platform == "opinion":
+                    arb_engine.update_opinion_prices(
+                        market.market_id,
+                        market.yes_price,
+                        market.no_price,
+                        question=market.question,
+                    )
+                elif market.platform == "myriad":
+                    arb_engine.update_myriad_prices(
                         market.market_id,
                         market.yes_price,
                         market.no_price,
@@ -460,8 +493,11 @@ def main():
                     size_usd = orderbook_arb.size_position(opp)
                     if size_usd > 0:
                         logger.info(
-                            "ORDERBOOK ARB: %s %s — complement=%.4f net=%.4f size=$%.2f",
-                            opp.direction, opp.asset,
+                            "[NL-PAPER] \u26a0\ufe0f Orderbook arb\n"
+                            "Market: %s | Direction: %s\n"
+                            "Complement: %.4f | Net: %.4f\n"
+                            "Size: $%.2f",
+                            opp.asset, opp.direction,
                             opp.complement_spread, opp.net_profit_per_share, size_usd,
                         )
                         notifier.send(
@@ -487,7 +523,7 @@ def main():
 
             # ── 11. Write state files for admin API ───────────────────
             if cycle_count % 10 == 0:
-                _write_balance_state(risk_manager, arb_engine, lifecycle_engine)
+                _write_balance_state(risk_manager, arb_engine, lifecycle_engine, paper_broker)
                 if lifecycle_engine:
                     _write_markets_state(lifecycle_engine)
 
@@ -501,8 +537,10 @@ def main():
 
             # ── 12. Dashboard state update ────────────────────────────
             try:
-                from dashboard.state import update_state
+                from dashboard.state import update_state, update_paper_state
                 update_state(risk_manager)
+                if paper_broker:
+                    update_paper_state(paper_broker)
             except Exception:
                 pass
 

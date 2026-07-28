@@ -46,6 +46,7 @@ def _list_str(key: str, default: List[str]) -> List[str]:
 @dataclass
 class Settings:
     trading_mode: str = os.getenv("TRADING_MODE", "paper")
+    training_mode: bool = _bool("TRAINING_MODE", True)
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
 
     # Polymarket
@@ -56,11 +57,16 @@ class Settings:
     polymarket_host: str = os.getenv("POLYMARKET_HOST", "https://clob.polymarket.com")
     gamma_api_host: str = os.getenv("GAMMA_API_HOST", "https://gamma-api.polymarket.com")
 
-    # Kalshi
-    kalshi_api_key: str = os.getenv("KALSHI_API_KEY", "")
-    kalshi_private_key: str = os.getenv("KALSHI_PRIVATE_KEY", "")
-    kalshi_api_base: str = os.getenv("KALSHI_API_BASE", "https://trading-api.kalshi.com/trade-api/v2")
-    kalshi_ws_base: str = os.getenv("KALSHI_WS_BASE", "wss://trading-api.kalshi.com/ws/v1")
+    # # Kalshi (commented out)
+    # kalshi_api_key: str = os.getenv("KALSHI_API_KEY", "")
+    # kalshi_private_key: str = os.getenv("KALSHI_PRIVATE_KEY", "")
+    # kalshi_api_base: str = os.getenv("KALSHI_API_BASE", "https://trading-api.kalshi.com/trade-api/v2")
+    # kalshi_ws_base: str = os.getenv("KALSHI_WS_BASE", "wss://trading-api.kalshi.com/ws/v1")
+
+    # Arbitrage platforms
+    limit_exchange_enabled: bool = _bool("LIMIT_EXCHANGE_ENABLED", True)
+    opinion_enabled: bool = _bool("OPINION_ENABLED", True)
+    myriad_enabled: bool = _bool("MYRIAD_ENABLED", True)
 
     # PMXT (unified prediction market API)
     pmxt_api_key: str = os.getenv("PMXT_API_KEY", "")
@@ -126,6 +132,13 @@ class Settings:
     # Trading strategy
     strategy: str = os.getenv("STRATEGY", "kelly")
 
+    # Paper trading (PaperLedger)
+    paper_backend: str = os.getenv("PAPER_BACKEND", "pm_trader")  # "pm_trader" | "local"
+    paper_ledger_state_file: str = os.getenv("PAPER_LEDGER_STATE_FILE", "data/paper_ledger_state.json")
+    paper_fee_bps: float = _float("PAPER_FEE_BPS", 200.0)
+    pm_trader_data_dir: str = os.getenv("PM_TRADER_DATA_DIR", "data/pm_trader")
+    pm_trader_starting_balance: float = _float("PM_TRADER_STARTING_BALANCE", 10000.0)
+
     # ML / AI
     ml_model_dir: str = os.getenv("ML_MODEL_DIR", "models")
     ml_retrain_interval_hours: int = _int("ML_RETRAIN_INTERVAL_HOURS", 168)
@@ -152,7 +165,7 @@ class Settings:
     brti_validation_enabled: bool = _bool("BRTI_VALIDATION_ENABLED", True)
     brti_max_divergence_bps: float = _float("BRTI_MAX_DIVERGENCE_BPS", 0.5)
     brti_tick_interval_seconds: int = _int("BRTI_TICK_INTERVAL_SECONDS", 1)
-    brti_kalshi_avg_window: int = _int("BRTI_KALSHI_AVG_WINDOW", 60)
+    # brti_kalshi_avg_window: int = _int("BRTI_KALSHI_AVG_WINDOW", 60)
 
     # ML BTC prediction (Layer 1)
     ml_btc_train_parallel: bool = _bool("ML_BTC_TRAIN_PARALLEL", True)
@@ -178,13 +191,13 @@ class Settings:
     dashboard_port: int = _int("DASHBOARD_PORT", 8080)
     dashboard_host: str = os.getenv("DASHBOARD_HOST", "0.0.0.0")
 
-    # Gnosis Safe / Relayer (gasless payments)
-    gnosis_safe_enabled: bool = _bool("GNOSIS_SAFE_ENABLED", False)
-    gnosis_safe_address: str = os.getenv("GNOSIS_SAFE_ADDRESS", "")
-    gnosis_safe_owner_key: str = os.getenv("GNOSIS_SAFE_OWNER_KEY", "")
-    relayer_enabled: bool = _bool("RELAYER_ENABLED", True)
-    relayer_gas_limit: int = _int("RELAYER_GAS_LIMIT", 500000)
-    batch_transactions: bool = _bool("BATCH_TRANSACTIONS", True)
+    # # Gnosis Safe / Relayer (gasless payments) — commented out
+    # gnosis_safe_enabled: bool = _bool("GNOSIS_SAFE_ENABLED", False)
+    # gnosis_safe_address: str = os.getenv("GNOSIS_SAFE_ADDRESS", "")
+    # gnosis_safe_owner_key: str = os.getenv("GNOSIS_SAFE_OWNER_KEY", "")
+    # relayer_enabled: bool = _bool("RELAYER_ENABLED", True)
+    # relayer_gas_limit: int = _int("RELAYER_GAS_LIMIT", 500000)
+    # batch_transactions: bool = _bool("BATCH_TRANSACTIONS", True)
 
     # 5-minute market engine
     lifecycle_engine_enabled: bool = _bool("LIFECYCLE_ENGINE_ENABLED", True)

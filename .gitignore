@@ -11,9 +11,14 @@ models/*.pt
 models/*.pkl
 models/*.txt
 .env
+<<<<<<< HEAD
 *.bak
 .env
 .env.*
 =
 *.save
 *.save.*
+=======
+data/pm_trader/
+data/paper_ledger_state.json
+>>>>>>> 32c68f77d638fc6e16d14e60950908040da48651
