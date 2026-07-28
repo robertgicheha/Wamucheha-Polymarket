@@ -107,8 +107,8 @@ class GnosisSafeRelayer:
 
     def __init__(self, config: Optional[RelayerConfig] = None):
         self.config = config or RelayerConfig(
-            enabled=settings.gnosis_safe_enabled,
-            safe_address=settings.gnosis_safe_address,
+            # enabled=settings.gnosis_safe_enabled,    # commented out — gasless module removed
+            # safe_address=settings.gnosis_safe_address,
         )
         self._stats = RelayerStats()
         self._pending_batches: Dict[str, BatchedTransaction] = {}

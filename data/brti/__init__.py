@@ -10,10 +10,8 @@ Reproduces the CF Benchmarks BRTI methodology:
   6. Applies exponential weighting (lambda = 1/5000)
   7. Computes BRTI as weighted sum of mid price-volume curve
   8. Publishes at 1-second frequency
-
-Kalshi settlement: 60-second average of BRTI ticks at contract close.
 """
 from data.brti.brti_engine import BRTIEngine
-from data.brti.kalshi_settlement import KalshiSettlementCalculator
+# from data.brti.kalshi_settlement import KalshiSettlementCalculator  # commented out
 
-__all__ = ["BRTIEngine", "KalshiSettlementCalculator"]
+__all__ = ["BRTIEngine"]

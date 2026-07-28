@@ -309,7 +309,7 @@ def arb(authorization: str = Header(None)):
         "total_pnl": arb_data.get("total_pnl", 0.0),
         "win_rate": arb_data.get("win_rate", 0.0),
         "pm_markets_tracked": arb_data.get("pm_markets_tracked", 0),
-        "kalshi_contracts_tracked": arb_data.get("kalshi_contracts_tracked", 0),
+        # "kalshi_contracts_tracked": arb_data.get("kalshi_contracts_tracked", 0),
     }
 
 

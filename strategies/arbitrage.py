@@ -1,6 +1,6 @@
 """
-Synthetic Arbitrage Engine — Polymarket + Kalshi cross-platform arb
-+ Orderbook-based intra-platform arbitrage for 5-minute markets.
+Synthetic Arbitrage Engine — Polymarket + Limit Exchange / Opinion / Myriad
+cross-platform arb + Orderbook-based intra-platform arbitrage for 5-minute markets.
 
 Cross-platform arb:
   Buy YES on one platform + NO on the other when combined price < $1.00.
@@ -31,9 +31,12 @@ from config.settings import settings
 logger = logging.getLogger(__name__)
 
 
+PLATFORMS = ["limit_exchange", "opinion", "myriad"]
+
+
 @dataclass
 class ArbOpportunity:
-    """One arbitrage opportunity between Polymarket and Kalshi."""
+    """One arbitrage opportunity between Polymarket and an alt platform."""
     timestamp: float
     market_question: str
 
@@ -44,20 +47,21 @@ class ArbOpportunity:
     pm_yes_token_id: str
     pm_no_token_id: str
 
-    # Kalshi side
-    kalshi_ticker: str
-    kalshi_yes_price: float
-    kalshi_no_price: float
-    kalshi_strike: float
+    # Alternative platform side
+    alt_platform: str  # "limit_exchange", "opinion", or "myriad"
+    alt_ticker: str
+    alt_yes_price: float
+    alt_no_price: float
+    alt_strike: float
 
     # Calculated
-    spread: float  # PM_yes + Kalshi_no (or vice versa)
+    spread: float  # PM_yes + alt_no (or vice versa)
     guaranteed_profit_per_share: float
-    direction: str  # "pm_yes_kalshi_no" or "pm_no_kalshi_yes"
+    direction: str  # "pm_yes_alt_no" or "pm_no_alt_yes"
 
     # Metadata
     pm_volume_24h: float = 0.0
-    kalshi_volume: int = 0
+    alt_volume: int = 0
     confidence: float = 0.0
     time_to_expiry: float = 0.0
 
@@ -67,8 +71,9 @@ class ArbOpportunity:
             "market_question": self.market_question,
             "pm_yes_price": self.pm_yes_price,
             "pm_no_price": self.pm_no_price,
-            "kalshi_yes_price": self.kalshi_yes_price,
-            "kalshi_no_price": self.kalshi_no_price,
+            "alt_platform": self.alt_platform,
+            "alt_yes_price": self.alt_yes_price,
+            "alt_no_price": self.alt_no_price,
             "spread": self.spread,
             "guaranteed_profit": self.guaranteed_profit_per_share,
             "direction": self.direction,
@@ -85,14 +90,14 @@ class ArbPosition:
 
     # Filled prices
     pm_fill_price: float
-    kalshi_fill_price: float
+    alt_fill_price: float
     pm_size_shares: float
-    kalshi_size_shares: float
+    alt_size_shares: float
     total_cost_usd: float
 
     # Current state
     current_pm_price: float = 0.0
-    current_kalshi_price: float = 0.0
+    current_alt_price: float = 0.0
     unrealized_pnl: float = 0.0
     hold_seconds: float = 0.0
 
@@ -105,7 +110,7 @@ class ArbPosition:
         return {
             "position_id": self.position_id,
             "pm_yes_price": self.pm_fill_price,
-            "kalshi_no_price": self.kalshi_fill_price,
+            "alt_price": self.alt_fill_price,
             "total_cost": self.total_cost_usd,
             "unrealized_pnl": round(self.unrealized_pnl, 4),
             "hold_seconds": round(self.hold_seconds, 1),
@@ -145,9 +150,10 @@ class ArbPerformance:
 
 class ArbitrageEngine:
     """
-    Cross-platform synthetic arbitrage between Polymarket and Kalshi.
+    Cross-platform synthetic arbitrage between Polymarket and
+    Limit Exchange / Opinion / Myriad.
 
-    Monitors prices on both platforms simultaneously and identifies
+    Monitors prices across platforms simultaneously and identifies
     opportunities where the combined cost of YES + NO < $1.00.
 
     Trading logic:
@@ -178,9 +184,11 @@ class ArbitrageEngine:
         self._on_opportunity_callbacks: List[Callable] = []
         self._on_trade_callbacks: List[Callable] = []
 
-        # Price state from both platforms
+        # Price state from platforms
         self._pm_prices: Dict[str, Dict] = {}
-        self._kalshi_prices: Dict[str, Dict] = {}
+        self._limit_exchange_prices: Dict[str, Dict] = {}
+        self._opinion_prices: Dict[str, Dict] = {}
+        self._myriad_prices: Dict[str, Dict] = {}
 
     # ── Public API ─────────────────────────────────────────────────────
 
@@ -199,47 +207,53 @@ class ArbitrageEngine:
             **kwargs,
         }
 
-    def update_kalshi_prices(self, ticker: str, yes_price: float, no_price: float, **kwargs) -> None:
-        """Update Kalshi prices for a contract."""
-        self._kalshi_prices[ticker] = {
-            "yes": yes_price,
-            "no": no_price,
-            "timestamp": time.time(),
-            **kwargs,
-        }
+    def update_limit_exchange_prices(self, ticker: str, yes_price: float, no_price: float, **kwargs) -> None:
+        self._limit_exchange_prices[ticker] = {"yes": yes_price, "no": no_price, "timestamp": time.time(), **kwargs}
+
+    def update_opinion_prices(self, ticker: str, yes_price: float, no_price: float, **kwargs) -> None:
+        self._opinion_prices[ticker] = {"yes": yes_price, "no": no_price, "timestamp": time.time(), **kwargs}
+
+    def update_myriad_prices(self, ticker: str, yes_price: float, no_price: float, **kwargs) -> None:
+        self._myriad_prices[ticker] = {"yes": yes_price, "no": no_price, "timestamp": time.time(), **kwargs}
+
+    def _price_dict(self, platform: str) -> Dict[str, Dict]:
+        return {
+            "limit_exchange": self._limit_exchange_prices,
+            "opinion": self._opinion_prices,
+            "myriad": self._myriad_prices,
+        }[platform]
 
     def scan_for_opportunities(self, market_mapping: Optional[List[Dict]] = None) -> List[ArbOpportunity]:
         """
-        Scan all known prices for arbitrage opportunities.
-
-        market_mapping: list of dicts linking PM and Kalshi markets:
-            [{"pm_market_id": "...", "kalshi_ticker": "...", "question": "..."}]
-
-        Returns list of new opportunities found.
+        Scan all known prices for arbitrage opportunities across
+        Polymarket vs Limit Exchange / Opinion / Myriad.
         """
         new_opportunities = []
 
-        if market_mapping is None:
-            # Try to match by question similarity
-            market_mapping = self._auto_match_markets()
+        for platform in PLATFORMS:
+            alt_prices = self._price_dict(platform)
+            if market_mapping is None:
+                mappings = self._auto_match_markets(platform)
+            else:
+                mappings = [m for m in market_mapping if m.get("alt_platform") == platform]
 
-        for mapping in market_mapping:
-            pm_id = mapping.get("pm_market_id", "")
-            kalshi_ticker = mapping.get("kalshi_ticker", "")
-            question = mapping.get("question", "")
+            for mapping in mappings:
+                pm_id = mapping.get("pm_market_id", "")
+                alt_ticker = mapping.get("alt_ticker", "")
+                question = mapping.get("question", "")
 
-            pm = self._pm_prices.get(pm_id)
-            kalshi = self._kalshi_prices.get(kalshi_ticker)
+                pm = self._pm_prices.get(pm_id)
+                alt = alt_prices.get(alt_ticker)
 
-            if pm is None or kalshi is None:
-                continue
+                if pm is None or alt is None:
+                    continue
 
-            # Check staleness (skip if data > 5 seconds old)
-            if time.time() - pm["timestamp"] > 5 or time.time() - kalshi["timestamp"] > 5:
-                continue
+                now = time.time()
+                if now - pm["timestamp"] > 5 or now - alt["timestamp"] > 5:
+                    continue
 
-            opps = self._check_arb(pm_id, pm, kalshi_ticker, kalshi, question)
-            new_opportunities.extend(opps)
+                opps = self._check_arb(pm_id, pm, alt_ticker, alt, question, platform)
+                new_opportunities.extend(opps)
 
         for opp in new_opportunities:
             self._opportunities.append(opp)
@@ -283,7 +297,7 @@ class ArbitrageEngine:
             return False
 
         # Liquidity check (basic)
-        if opportunity.pm_volume_24h < 100 or opportunity.kalshi_volume < 10:
+        if opportunity.pm_volume_24h < 100 or opportunity.alt_volume < 10:
             logger.debug("Arb rejected: insufficient liquidity")
             return False
 
@@ -329,34 +343,34 @@ class ArbitrageEngine:
             return None
 
         # Calculate shares for each side
-        if opportunity.direction == "pm_yes_kalshi_no":
+        if opportunity.direction == "pm_yes_alt_no":
             pm_price = opportunity.pm_yes_price
-            kalshi_price = opportunity.kalshi_no_price
+            alt_price = opportunity.alt_no_price
         else:
             pm_price = opportunity.pm_no_price
-            kalshi_price = opportunity.kalshi_yes_price
+            alt_price = opportunity.alt_yes_price
 
         pm_shares = size_usd / 2 / pm_price if pm_price > 0 else 0
-        kalshi_shares = size_usd / 2 / kalshi_price if kalshi_price > 0 else 0
+        alt_shares = size_usd / 2 / alt_price if alt_price > 0 else 0
 
         # Simulate execution (with slippage)
         slippage = 0.005  # 0.5% slippage per leg
         pm_fill = pm_price * (1 + slippage)
-        kalshi_fill = kalshi_price * (1 + slippage)
+        alt_fill = alt_price * (1 + slippage)
 
-        total_cost = pm_shares * pm_fill + kalshi_shares * kalshi_fill
+        total_cost = pm_shares * pm_fill + alt_shares * alt_fill
 
         position = ArbPosition(
             position_id=f"arb_{int(time.time() * 1000)}",
             opportunity=opportunity,
             opened_at=time.time(),
             pm_fill_price=pm_fill,
-            kalshi_fill_price=kalshi_fill,
+            alt_fill_price=alt_fill,
             pm_size_shares=pm_shares,
-            kalshi_size_shares=kalshi_shares,
+            alt_size_shares=alt_shares,
             total_cost_usd=total_cost,
             current_pm_price=pm_fill,
-            current_kalshi_price=kalshi_fill,
+            current_alt_price=alt_fill,
         )
 
         self._positions[position.position_id] = position
@@ -373,34 +387,37 @@ class ArbitrageEngine:
                 logger.error("Trade callback error: %s", e)
 
         logger.info(
-            "ARB OPENED: %s %s (PM=%.3f, Kalshi=%.3f, cost=$%.2f, profit=$%.4f)",
-            opportunity.direction,
-            opportunity.market_question[:50],
-            pm_fill, kalshi_fill, total_cost,
-            opportunity.guaranteed_profit_per_share * min(pm_shares, kalshi_shares),
+            "[NL-PAPER] \u26a0\ufe0f Arb opened\n"
+            "Market: %s\n"
+            "Direction: %s | PM=%.3f | %s=%.3f\n"
+            "Cost: $%.2f | Profit: $%.4f\n"
+            "Bankroll: $%.2f",
+            opportunity.market_question[:60], opportunity.direction,
+            pm_fill, opportunity.alt_platform, alt_fill,
+            total_cost,
+            opportunity.guaranteed_profit_per_share * min(pm_shares, alt_shares),
+            self.bankroll,
         )
 
         return position
 
-    def update_position_prices(self, position_id: str, pm_price: float, kalshi_price: float) -> None:
-        """Update current prices for an open position."""
+    def update_position_prices(self, position_id: str, pm_price: float, alt_price: float) -> None:
         pos = self._positions.get(position_id)
         if pos is None or pos.closed:
             return
 
         pos.current_pm_price = pm_price
-        pos.current_kalshi_price = kalshi_price
+        pos.current_alt_price = alt_price
         pos.hold_seconds = time.time() - pos.opened_at
 
-        # Calculate unrealized P&L
-        if pos.opportunity.direction == "pm_yes_kalshi_no":
+        if pos.opportunity.direction == "pm_yes_alt_no":
             pm_value = pos.pm_size_shares * pm_price
-            kalshi_value = pos.kalshi_size_shares * (1 - kalshi_price)
+            alt_value = pos.alt_size_shares * (1 - alt_price)
         else:
             pm_value = pos.pm_size_shares * (1 - pm_price)
-            kalshi_value = pos.kalshi_size_shares * kalshi_price
+            alt_value = pos.alt_size_shares * alt_price
 
-        pos.unrealized_pnl = (pm_value + kalshi_value) - pos.total_cost_usd
+        pos.unrealized_pnl = (pm_value + alt_value) - pos.total_cost_usd
 
     def check_exits(self) -> List[str]:
         """
@@ -423,10 +440,10 @@ class ArbitrageEngine:
                 continue
 
             # Spread convergence check
-            if pos.opportunity.direction == "pm_yes_kalshi_no":
-                current_spread = pos.current_pm_price + pos.current_kalshi_price
+            if pos.opportunity.direction == "pm_yes_alt_no":
+                current_spread = pos.current_pm_price + pos.current_alt_price
             else:
-                current_spread = (1 - pos.current_pm_price) + (1 - pos.current_kalshi_price)
+                current_spread = (1 - pos.current_pm_price) + (1 - pos.current_alt_price)
 
             # Exit if spread has converged to near $1.00 (arb is gone)
             if current_spread >= 0.995:
@@ -442,14 +459,14 @@ class ArbitrageEngine:
             return None
 
         # Calculate exit value
-        if pos.opportunity.direction == "pm_yes_kalshi_no":
+        if pos.opportunity.direction == "pm_yes_alt_no":
             pm_value = pos.pm_size_shares * pos.current_pm_price
-            kalshi_value = pos.kalshi_size_shares * (1 - pos.current_kalshi_price)
+            alt_value = pos.alt_size_shares * (1 - pos.current_alt_price)
         else:
             pm_value = pos.pm_size_shares * (1 - pos.current_pm_price)
-            kalshi_value = pos.kalshi_size_shares * pos.current_kalshi_price
+            alt_value = pos.alt_size_shares * pos.current_alt_price
 
-        exit_value = pm_value + kalshi_value
+        exit_value = pm_value + alt_value
         exit_pnl = exit_value - pos.total_cost_usd
 
         pos.closed = True
@@ -477,8 +494,11 @@ class ArbitrageEngine:
         self._performance.avg_profit_per_trade = sum(pnls) / len(pnls)
 
         logger.info(
-            "ARB CLOSED: %s (pnl=$%.4f, hold=%.1fs)",
-            position_id, exit_pnl, pos.hold_seconds,
+            "[NL-PAPER] \u26a0\ufe0f Arb closed\n"
+            "Position: %s | pnl=$%.4f\n"
+            "Hold: %.1fs | Bankroll: $%.2f",
+            position_id, exit_pnl,
+            pos.hold_seconds, self.bankroll,
         )
 
         return pos
@@ -487,16 +507,16 @@ class ArbitrageEngine:
         self,
         pm_id: str,
         pm: Dict,
-        kalshi_ticker: str,
-        kalshi: Dict,
+        alt_ticker: str,
+        alt: Dict,
         question: str,
+        platform: str,
     ) -> List[ArbOpportunity]:
-        """Check for arbitrage between one PM market and one Kalshi contract."""
+        """Check for arbitrage between one PM market and one alt platform contract."""
         opportunities = []
 
-        # Direction 1: PM YES + Kalshi NO
-        # If PM_yes + Kalshi_no < 1.00, buy both = guaranteed profit
-        spread_1 = pm["yes"] + kalshi["no"]
+        # Direction 1: PM YES + alt NO
+        spread_1 = pm["yes"] + alt["no"]
         profit_1 = 1.0 - spread_1
 
         if profit_1 > 0:
@@ -508,23 +528,23 @@ class ArbitrageEngine:
                 pm_no_price=pm["no"],
                 pm_yes_token_id=pm.get("yes_token_id", ""),
                 pm_no_token_id=pm.get("no_token_id", ""),
-                kalshi_ticker=kalshi_ticker,
-                kalshi_yes_price=kalshi["yes"],
-                kalshi_no_price=kalshi["no"],
-                kalshi_strike=kalshi.get("strike", 0),
+                alt_platform=platform,
+                alt_ticker=alt_ticker,
+                alt_yes_price=alt["yes"],
+                alt_no_price=alt["no"],
+                alt_strike=alt.get("strike", 0),
                 spread=spread_1,
                 guaranteed_profit_per_share=profit_1,
-                direction="pm_yes_kalshi_no",
+                direction="pm_yes_alt_no",
                 pm_volume_24h=pm.get("volume_24h", 0),
-                kalshi_volume=kalshi.get("volume", 0),
+                alt_volume=alt.get("volume", 0),
                 confidence=min(1.0, profit_1 / 0.05),
-                time_to_expiry=kalshi.get("time_to_expiry", 0),
+                time_to_expiry=alt.get("time_to_expiry", 0),
             )
             opportunities.append(opp)
 
-        # Direction 2: PM NO + Kalshi YES
-        # If PM_no + Kalshi_yes < 1.00, buy both = guaranteed profit
-        spread_2 = pm["no"] + kalshi["yes"]
+        # Direction 2: PM NO + alt YES
+        spread_2 = pm["no"] + alt["yes"]
         profit_2 = 1.0 - spread_2
 
         if profit_2 > 0:
@@ -536,37 +556,39 @@ class ArbitrageEngine:
                 pm_no_price=pm["no"],
                 pm_yes_token_id=pm.get("yes_token_id", ""),
                 pm_no_token_id=pm.get("no_token_id", ""),
-                kalshi_ticker=kalshi_ticker,
-                kalshi_yes_price=kalshi["yes"],
-                kalshi_no_price=kalshi["no"],
-                kalshi_strike=kalshi.get("strike", 0),
+                alt_platform=platform,
+                alt_ticker=alt_ticker,
+                alt_yes_price=alt["yes"],
+                alt_no_price=alt["no"],
+                alt_strike=alt.get("strike", 0),
                 spread=spread_2,
                 guaranteed_profit_per_share=profit_2,
-                direction="pm_no_kalshi_yes",
+                direction="pm_no_alt_yes",
                 pm_volume_24h=pm.get("volume_24h", 0),
-                kalshi_volume=kalshi.get("volume", 0),
+                alt_volume=alt.get("volume", 0),
                 confidence=min(1.0, profit_2 / 0.05),
-                time_to_expiry=kalshi.get("time_to_expiry", 0),
+                time_to_expiry=alt.get("time_to_expiry", 0),
             )
             opportunities.append(opp)
 
         return opportunities
 
-    def _auto_match_markets(self) -> List[Dict]:
-        """Auto-match PM and Kalshi markets by question similarity."""
+    def _auto_match_markets(self, platform: str) -> List[Dict]:
+        """Auto-match PM and alt platform markets by question similarity."""
+        alt_prices = self._price_dict(platform)
         mappings = []
         for pm_id, pm_data in self._pm_prices.items():
             pm_question = pm_data.get("question", "").lower()
-            for kalshi_ticker, kalshi_data in self._kalshi_prices.items():
-                kalshi_question = kalshi_data.get("question", "").lower()
-                # Simple similarity: check if key words overlap
+            for alt_ticker, alt_data in alt_prices.items():
+                alt_question = alt_data.get("question", "").lower()
                 pm_words = set(pm_question.split())
-                kalshi_words = set(kalshi_question.split())
-                overlap = len(pm_words & kalshi_words)
+                alt_words = set(alt_question.split())
+                overlap = len(pm_words & alt_words)
                 if overlap >= 3:
                     mappings.append({
                         "pm_market_id": pm_id,
-                        "kalshi_ticker": kalshi_ticker,
+                        "alt_ticker": alt_ticker,
+                        "alt_platform": platform,
                         "question": pm_question,
                     })
         return mappings
@@ -586,7 +608,9 @@ class ArbitrageEngine:
             "avg_hold_seconds": round(self._performance.avg_hold_seconds, 1),
             "avg_profit_per_trade": round(self._performance.avg_profit_per_trade, 4),
             "pm_markets_tracked": len(self._pm_prices),
-            "kalshi_contracts_tracked": len(self._kalshi_prices),
+            "limit_exchange_tracked": len(self._limit_exchange_prices),
+            "opinion_tracked": len(self._opinion_prices),
+            "myriad_tracked": len(self._myriad_prices),
         }
 
     @property

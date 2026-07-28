@@ -57,11 +57,16 @@ class Settings:
     polymarket_host: str = os.getenv("POLYMARKET_HOST", "https://clob.polymarket.com")
     gamma_api_host: str = os.getenv("GAMMA_API_HOST", "https://gamma-api.polymarket.com")
 
-    # Kalshi
-    kalshi_api_key: str = os.getenv("KALSHI_API_KEY", "")
-    kalshi_private_key: str = os.getenv("KALSHI_PRIVATE_KEY", "")
-    kalshi_api_base: str = os.getenv("KALSHI_API_BASE", "https://trading-api.kalshi.com/trade-api/v2")
-    kalshi_ws_base: str = os.getenv("KALSHI_WS_BASE", "wss://trading-api.kalshi.com/ws/v1")
+    # # Kalshi (commented out)
+    # kalshi_api_key: str = os.getenv("KALSHI_API_KEY", "")
+    # kalshi_private_key: str = os.getenv("KALSHI_PRIVATE_KEY", "")
+    # kalshi_api_base: str = os.getenv("KALSHI_API_BASE", "https://trading-api.kalshi.com/trade-api/v2")
+    # kalshi_ws_base: str = os.getenv("KALSHI_WS_BASE", "wss://trading-api.kalshi.com/ws/v1")
+
+    # Arbitrage platforms
+    limit_exchange_enabled: bool = _bool("LIMIT_EXCHANGE_ENABLED", True)
+    opinion_enabled: bool = _bool("OPINION_ENABLED", True)
+    myriad_enabled: bool = _bool("MYRIAD_ENABLED", True)
 
     # PMXT (unified prediction market API)
     pmxt_api_key: str = os.getenv("PMXT_API_KEY", "")
@@ -160,7 +165,7 @@ class Settings:
     brti_validation_enabled: bool = _bool("BRTI_VALIDATION_ENABLED", True)
     brti_max_divergence_bps: float = _float("BRTI_MAX_DIVERGENCE_BPS", 0.5)
     brti_tick_interval_seconds: int = _int("BRTI_TICK_INTERVAL_SECONDS", 1)
-    brti_kalshi_avg_window: int = _int("BRTI_KALSHI_AVG_WINDOW", 60)
+    # brti_kalshi_avg_window: int = _int("BRTI_KALSHI_AVG_WINDOW", 60)
 
     # ML BTC prediction (Layer 1)
     ml_btc_train_parallel: bool = _bool("ML_BTC_TRAIN_PARALLEL", True)
@@ -186,13 +191,13 @@ class Settings:
     dashboard_port: int = _int("DASHBOARD_PORT", 8080)
     dashboard_host: str = os.getenv("DASHBOARD_HOST", "0.0.0.0")
 
-    # Gnosis Safe / Relayer (gasless payments)
-    gnosis_safe_enabled: bool = _bool("GNOSIS_SAFE_ENABLED", False)
-    gnosis_safe_address: str = os.getenv("GNOSIS_SAFE_ADDRESS", "")
-    gnosis_safe_owner_key: str = os.getenv("GNOSIS_SAFE_OWNER_KEY", "")
-    relayer_enabled: bool = _bool("RELAYER_ENABLED", True)
-    relayer_gas_limit: int = _int("RELAYER_GAS_LIMIT", 500000)
-    batch_transactions: bool = _bool("BATCH_TRANSACTIONS", True)
+    # # Gnosis Safe / Relayer (gasless payments) — commented out
+    # gnosis_safe_enabled: bool = _bool("GNOSIS_SAFE_ENABLED", False)
+    # gnosis_safe_address: str = os.getenv("GNOSIS_SAFE_ADDRESS", "")
+    # gnosis_safe_owner_key: str = os.getenv("GNOSIS_SAFE_OWNER_KEY", "")
+    # relayer_enabled: bool = _bool("RELAYER_ENABLED", True)
+    # relayer_gas_limit: int = _int("RELAYER_GAS_LIMIT", 500000)
+    # batch_transactions: bool = _bool("BATCH_TRANSACTIONS", True)
 
     # 5-minute market engine
     lifecycle_engine_enabled: bool = _bool("LIFECYCLE_ENGINE_ENABLED", True)
