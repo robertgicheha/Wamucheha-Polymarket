@@ -36,6 +36,7 @@ class DashboardState:
     halted: bool = False
     halt_reason: Optional[str] = None
     mode: str = "paper"
+    training_mode: bool = True
 
     # Positions & history
     open_positions: List[Position] = field(default_factory=list)
@@ -66,6 +67,18 @@ class DashboardState:
     # Milestone tracking
     last_milestone_pct: float = 0.0
     milestone_alerts: List[str] = field(default_factory=list)
+
+    # Paper trading (training mode)
+    paper_balance: float = 0.0
+    paper_starting_balance: float = 0.0
+    paper_positions_value: float = 0.0
+    paper_total_value: float = 0.0
+    paper_pnl: float = 0.0
+    paper_positions: Dict = field(default_factory=dict)
+    paper_total_trades: int = 0
+    paper_total_fees: float = 0.0
+    paper_backend: str = "pm_trader"
+    paper_analytics: Dict = field(default_factory=dict)
 
 
 _state = DashboardState()
@@ -130,6 +143,7 @@ def update_state(
         halted=risk_manager.halted,
         halt_reason=risk_manager.halt_reason,
         mode=settings.trading_mode.upper(),
+        training_mode=settings.training_mode,
         open_positions=list(risk_manager.open_positions.values()),
         recent_trades=risk_manager.trade_history[-20:],
         withdrawal_history=risk_manager.withdrawal_history[-10:],
@@ -151,3 +165,27 @@ def update_state(
 
 def get_state() -> DashboardState:
     return _state
+
+
+def update_paper_state(paper_broker) -> None:
+    """Update paper trading fields in the dashboard state."""
+    global _state
+    if paper_broker is None:
+        return
+    try:
+        summary = paper_broker.summary()
+        analytics = {}
+        if hasattr(paper_broker, "get_analytics"):
+            analytics = paper_broker.get_analytics()
+        _state.paper_balance = summary.get("balance", 0.0)
+        _state.paper_starting_balance = summary.get("starting_balance", 0.0)
+        _state.paper_positions_value = summary.get("positions_value", 0.0)
+        _state.paper_total_value = summary.get("total_value", 0.0)
+        _state.paper_pnl = summary.get("pnl", 0.0)
+        _state.paper_positions = summary.get("open_positions", {})
+        _state.paper_total_trades = summary.get("total_trades", 0)
+        _state.paper_total_fees = summary.get("total_fees", 0.0)
+        _state.paper_backend = getattr(paper_broker, "__class__", type).__name__
+        _state.paper_analytics = analytics
+    except Exception:
+        pass
