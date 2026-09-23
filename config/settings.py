@@ -152,6 +152,7 @@ class Settings:
     ml_min_samples_for_training: int = _int("ML_MIN_SAMPLES_FOR_TRAINING", 50)
     ml_kelly_fraction: float = _float("ML_KELLY_FRACTION", 0.25)
     ml_confidence_threshold: float = _float("ML_CONFIDENCE_THRESHOLD", 0.3)
+    ml_prediction_enabled: bool = _bool("ML_PREDICTION_ENABLED", False)
 
     # BRTI Engine
     brti_exchanges: List[str] = field(
@@ -190,6 +191,8 @@ class Settings:
 
     dashboard_port: int = _int("DASHBOARD_PORT", 8080)
     dashboard_host: str = os.getenv("DASHBOARD_HOST", "0.0.0.0")
+    dashboard_username: str = os.getenv("DASHBOARD_USERNAME", "")
+    dashboard_password: str = os.getenv("DASHBOARD_PASSWORD", "")
 
     # # Gnosis Safe / Relayer (gasless payments) — commented out
     # gnosis_safe_enabled: bool = _bool("GNOSIS_SAFE_ENABLED", False)

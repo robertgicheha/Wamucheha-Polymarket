@@ -10,7 +10,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -30,6 +30,23 @@ logger = logging.getLogger(__name__)
 
 WINDOW_SECONDS = 900
 TTE_BINS = list(range(1, WINDOW_SECONDS + 1))
+
+
+def self_relative_labels(price_series: np.ndarray, tte: int) -> np.ndarray:
+    """
+    Label = 1 if price is higher `tte` steps ahead than it is right now, else
+    0. Self-relative rather than compared to a fixed strike, because
+    Polymarket's 5-min crypto markets are ATM (price_to_beat is set at
+    window open, ~= spot price then) — "will price be up over the next N
+    seconds" is the target that actually transfers across different windows
+    and different price levels over a long historical training set.
+    """
+    if tte >= len(price_series):
+        return np.array([])
+    future_prices = price_series[tte:]
+    current_prices = price_series[:-tte]
+    min_len = min(len(future_prices), len(current_prices))
+    return (future_prices[:min_len] > current_prices[:min_len]).astype(float)
 
 
 class TTEModelSet:
@@ -129,7 +146,8 @@ class TTETrainingOrchestrator:
       1. Collect historical BTC data (trade + orderbook)
       2. Compute ~80 features via BTCFeatureEngine
       3. For each TTE bin (1-900 seconds):
-         a. Create labels: was price > strike at TTE seconds later?
+         a. Create labels: was price higher `tte` seconds later than it was
+            at prediction time? (self-relative — matches ATM 5-min markets)
          b. Train L1a (LR) — baseline
          c. Train L1b (LSTM, GRU, XGBoost) — only keep if Brier < LR
          d. Combine L1 outputs -> train L2 (Logistic Regression)
@@ -147,6 +165,7 @@ class TTETrainingOrchestrator:
         self,
         model_dir: Optional[str] = None,
         max_workers: Optional[int] = None,
+        data_provider: Optional[Callable[[], Optional[pd.DataFrame]]] = None,
     ):
         self.model_dir = model_dir or settings.ml_model_dir
         self.max_workers = max_workers or settings.ml_btc_max_workers
@@ -157,6 +176,11 @@ class TTETrainingOrchestrator:
         self.last_full_retrain: Optional[datetime] = None
         self.last_incremental_retrain: Optional[datetime] = None
         self.training_metrics: Dict = {}
+        # Callable returning the latest raw price/orderbook DataFrame (see
+        # data/btc_tick_buffer.py::build_feature_frame's input shape) to train
+        # on. Injected rather than importing BRTIEngine directly, so this
+        # module stays independent of the live data-collection layer.
+        self.data_provider = data_provider
 
         for tte in TTE_BINS:
             self.tte_models[tte] = TTEModelSet(tte)
@@ -225,9 +249,9 @@ class TTETrainingOrchestrator:
                 logger.error("Failed to save TTE %d: %s", model_set.tte_seconds, e)
         logger.info("Saved all TTE models to %s", self.model_dir)
 
-    async def train_full(self, data: pd.DataFrame, strike_price: float) -> Dict:
+    async def train_full(self, data: pd.DataFrame) -> Dict:
         start_time = time.time()
-        logger.info("Starting full TTE retrain (%d rows, strike=$%.2f)", len(data), strike_price)
+        logger.info("Starting full TTE retrain (%d rows)", len(data))
 
         features = self.feature_engine.compute_all_features(data)
         if features.empty:
@@ -236,15 +260,7 @@ class TTETrainingOrchestrator:
         logger.info("Features computed: %d cols, %d rows", len(features.columns), len(features))
 
         price_series = data["price"].values
-        labels = {}
-        for tte in TTE_BINS:
-            if tte < len(price_series):
-                future_prices = price_series[tte:]
-                current_prices = price_series[:-tte]
-                min_len = min(len(future_prices), len(current_prices))
-                labels[tte] = (future_prices[:min_len] > strike_price).astype(float)
-            else:
-                labels[tte] = np.array([])
+        labels = {tte: self_relative_labels(price_series, tte) for tte in TTE_BINS}
 
         results = {}
         trained_count = 0
@@ -283,7 +299,6 @@ class TTETrainingOrchestrator:
             "median_brier": float(np.median(all_brier)) if all_brier else None,
             "best_brier": float(np.min(all_brier)) if all_brier else None,
             "worst_brier": float(np.max(all_brier)) if all_brier else None,
-            "strike_price": strike_price,
             "feature_count": len(features.columns),
         }
         self.training_metrics = summary
@@ -294,7 +309,7 @@ class TTETrainingOrchestrator:
         return summary
 
     async def train_incremental(
-        self, data: pd.DataFrame, strike_price: float, max_tte: int = 60
+        self, data: pd.DataFrame, max_tte: int = 60
     ) -> Dict:
         start_time = time.time()
         features = self.feature_engine.compute_all_features(data)
@@ -304,15 +319,10 @@ class TTETrainingOrchestrator:
         price_series = data["price"].values
         trained = 0
         for tte in range(1, min(max_tte + 1, WINDOW_SECONDS + 1)):
-            if tte >= len(price_series):
+            y = self_relative_labels(price_series, tte)
+            if len(y) < 50:
                 continue
-            future = price_series[tte:]
-            current = price_series[:-tte]
-            ml = min(len(future), len(current))
-            if ml < 50:
-                continue
-            y = (future[:ml] > strike_price).astype(float)
-            X = features.iloc[:ml]
+            X = features.iloc[:len(y)]
             try:
                 await self._train_tte_model_set(self.tte_models[tte], X, y)
                 trained += 1
@@ -436,10 +446,24 @@ class TTETrainingOrchestrator:
         while self._running:
             now = datetime.now(timezone.utc)
             try:
-                if self.should_full_retrain():
+                if self.data_provider is None:
+                    logger.debug("No data_provider configured, skipping retrain check")
+                elif self.should_full_retrain():
                     logger.info("Scheduled full retrain triggered (hour=%d)", now.hour)
+                    data = self.data_provider()
+                    if data is None or data.empty:
+                        logger.warning("Full retrain skipped: data_provider returned no data")
+                    else:
+                        result = await self.train_full(data)
+                        logger.info("Full retrain result: %s", result)
                 elif self.should_incremental_retrain():
                     logger.info("Scheduled incremental retrain triggered")
+                    data = self.data_provider()
+                    if data is None or data.empty:
+                        logger.warning("Incremental retrain skipped: data_provider returned no data")
+                    else:
+                        result = await self.train_incremental(data)
+                        logger.info("Incremental retrain result: %s", result)
             except Exception as e:
                 logger.error("Retrain loop error: %s", e)
 

@@ -1,16 +1,58 @@
 """
 Read-only monitoring dashboard with manual withdrawal endpoint.
-Displays compounding metrics, trade history, and allows manual profit withdrawal.
+Displays compounding metrics, real-time BTC/lifecycle-engine state, model
+accuracy, trade history, arbitrage stats, and a log tail.
 
 Run standalone:  python -m dashboard.app
 In production, main.py starts this in a background thread.
+
+Auth: if DASHBOARD_USERNAME/DASHBOARD_PASSWORD are set in .env, every route
+requires HTTP Basic Auth. If they're NOT set, the dashboard is wide open —
+fine for localhost-only access, dangerous if the port is reachable from the
+public internet (the /api/withdraw endpoint moves money). Set them before
+exposing this beyond an SSH tunnel / localhost.
 """
-from flask import Flask, jsonify, render_template_string, request
+import os
+import time
+from functools import wraps
+
+from flask import Flask, Response, jsonify, render_template_string, request
 
 from config.settings import settings
 from dashboard.state import get_state
 
 app = Flask(__name__)
+
+BOT_LOG_PATH = os.environ.get("BOT_LOG_PATH", "logs/bot.log")
+
+
+# ── Auth ─────────────────────────────────────────────────────────────────
+
+def _auth_configured() -> bool:
+    return bool(settings.dashboard_username and settings.dashboard_password)
+
+
+def _check_auth(auth) -> bool:
+    return (
+        auth is not None
+        and auth.username == settings.dashboard_username
+        and auth.password == settings.dashboard_password
+    )
+
+
+def require_auth(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not _auth_configured():
+            return view(*args, **kwargs)
+        if not _check_auth(request.authorization):
+            return Response(
+                "Authentication required", 401,
+                {"WWW-Authenticate": 'Basic realm="Polymarket Bot Dashboard"'},
+            )
+        return view(*args, **kwargs)
+    return wrapped
+
 
 PAGE = """
 <!doctype html>
@@ -24,15 +66,17 @@ PAGE = """
     h2 { color: #8b949e; margin-top: 1.5rem; }
     .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
             padding: 1rem; margin-bottom: 1rem; }
-    .metric { display: inline-block; margin-right: 2rem; min-width: 120px; }
+    .metric { display: inline-block; margin-right: 2rem; min-width: 120px; margin-bottom: 0.5rem; }
     .metric .label { color: #8b949e; font-size: 0.85rem; }
     .metric .value { font-size: 1.4rem; }
+    .metric .value.small { font-size: 1.1rem; }
     .metric .value.profit { color: #3fb950; }
     .metric .value.loss { color: #f85149; }
     .halted { color: #f85149; font-weight: bold; }
     .ok { color: #3fb950; }
+    .warn { color: #d29922; }
     table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: 0.4rem; border-bottom: 1px solid #30363d; }
+    th, td { text-align: left; padding: 0.4rem; border-bottom: 1px solid #30363d; font-size: 0.9rem; }
     .withdraw-form { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
                      padding: 1.5rem; margin-top: 1rem; }
     .withdraw-form input { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d;
@@ -47,31 +91,67 @@ PAGE = """
             padding: 0.3rem 0.8rem; border-radius: 4px; }
     nav a:hover { background: #161b22; }
     nav a.active { background: #238636; color: white; }
-    .training-badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px;
-                      font-size: 0.8rem; margin-left: 0.5rem; }
-    .training-on { background: #238636; color: white; }
-    .training-off { background: #30363d; color: #8b949e; }
+    .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px;
+             font-size: 0.8rem; margin-left: 0.5rem; }
+    .badge-on { background: #238636; color: white; }
+    .badge-off { background: #30363d; color: #8b949e; }
+    .badge-warn { background: #9e6a03; color: white; }
+    .security-banner { background: #3d1e00; border: 1px solid #9e6a03; color: #ffcc80;
+                        padding: 0.8rem 1rem; border-radius: 8px; margin-bottom: 1rem; }
   </style>
 </head>
 <body>
   <nav>
     <a href="/" class="active">Dashboard</a>
     <a href="/paper">Paper Trade (Training)
-      {% if state.training_mode %}
-      <span class="training-badge training-on">ON</span>
-      {% else %}
-      <span class="training-badge training-off">OFF</span>
-      {% endif %}
+      {% if state.training_mode %}<span class="badge badge-on">ON</span>
+      {% else %}<span class="badge badge-off">OFF</span>{% endif %}
     </a>
+    <a href="/logs">Logs</a>
   </nav>
 
+  {% if not auth_configured %}
+  <div class="security-banner">
+    <strong>No dashboard password set.</strong> This page (and the withdraw
+    endpoint) is open to anyone who can reach this port. Set
+    DASHBOARD_USERNAME / DASHBOARD_PASSWORD in .env before exposing this
+    beyond localhost or an SSH tunnel.
+  </div>
+  {% endif %}
+
   <h1>Polymarket Bot -- {{ state.mode }} mode
-    {% if state.training_mode %}
-    <span class="training-badge training-on">TRAINING</span>
-    {% else %}
-    <span class="training-badge training-off">LIVE READY</span>
-    {% endif %}
+    {% if state.training_mode %}<span class="badge badge-on">TRAINING</span>
+    {% else %}<span class="badge badge-off">LIVE READY</span>{% endif %}
+    {% if state.halted %}<span class="badge badge-warn">HALTED</span>{% endif %}
   </h1>
+
+  <div class="card">
+    <h2>Bot Health</h2>
+    <div class="metric"><div class="label">Uptime</div><div class="value small">{{ "%.1f"|format(state.uptime_seconds / 3600) }}h</div></div>
+    <div class="metric"><div class="label">Status</div>
+      <div class="value small {{ 'halted' if state.halted else 'ok' }}">
+        {{ 'HALTED: ' + state.halt_reason if state.halted else 'RUNNING' }}
+      </div>
+    </div>
+    <div class="metric"><div class="label">Strategy</div><div class="value small">{{ state.active_strategy }}</div></div>
+    <div class="metric"><div class="label">ML Prediction</div>
+      <div class="value small {{ 'ok' if state.ml_prediction_enabled else '' }}">
+        {{ 'ENABLED' if state.ml_prediction_enabled else 'fallback heuristic' }}
+      </div>
+    </div>
+    <div class="metric"><div class="label">TTE Models Trained</div>
+      <div class="value small">{{ state.tte_models_fitted }} / {{ state.tte_total_models }}</div>
+    </div>
+    <div class="metric"><div class="label">Last Retrain</div><div class="value small">{{ state.last_retrain or "never" }}</div></div>
+  </div>
+
+  <div class="card">
+    <h2>Live BTC Price (BRTI)</h2>
+    <div class="metric"><div class="label">Price</div><div class="value">${{ "%.2f"|format(state.brti_price) }}</div></div>
+    <div class="metric"><div class="label">Spread</div><div class="value small">{{ "%.2f"|format(state.brti_spread_bps) }} bps</div></div>
+    <div class="metric"><div class="label">Exchanges</div><div class="value small">{{ state.brti_exchanges_used }}</div></div>
+    <div class="metric"><div class="label">Ticks Received</div><div class="value small">{{ state.brti_tick_count }}</div></div>
+  </div>
 
   <div class="card">
     <h2>Compounding Status</h2>
@@ -99,11 +179,65 @@ PAGE = """
     <div class="metric"><div class="label">Losses</div><div class="value loss">{{ state.total_losses }}</div></div>
     <div class="metric"><div class="label">Win Rate</div><div class="value">{{ "%.1f"|format(state.win_rate) }}%</div></div>
     <div class="metric"><div class="label">Consec. Losses</div><div class="value">{{ state.consecutive_losses }}</div></div>
-    <div class="metric"><div class="label">Status</div>
-      <div class="value {{ 'halted' if state.halted else 'ok' }}">
-        {{ 'HALTED: ' + state.halt_reason if state.halted else 'RUNNING' }}
+  </div>
+
+  <div class="card">
+    <h2>Model Accuracy (live)</h2>
+    {% if state.model_accuracy.get('n_predictions', 0) > 0 %}
+    <div class="metric"><div class="label">Predictions Scored</div><div class="value small">{{ state.model_accuracy.n_predictions }}</div></div>
+    <div class="metric"><div class="label">Brier Score</div>
+      <div class="value small {{ 'ok' if state.model_accuracy.get('better_than_baseline') else 'warn' }}">
+        {{ "%.4f"|format(state.model_accuracy.brier_score) }}
       </div>
     </div>
+    <div class="metric"><div class="label">vs. Baseline (0.5)</div><div class="value small">{{ "%.4f"|format(state.model_accuracy.baseline_brier_score) }}</div></div>
+    <div class="metric"><div class="label">Beating Baseline?</div>
+      <div class="value small {{ 'ok' if state.model_accuracy.get('better_than_baseline') else 'loss' }}">
+        {{ 'YES' if state.model_accuracy.get('better_than_baseline') else 'NO' }}
+      </div>
+    </div>
+    <div class="info">Lower Brier is better. Computed from real trade outcomes vs. the model_prob logged at entry — not a backtest number.</div>
+    {% else %}
+    <p style="color: #8b949e;">No scored predictions yet — needs ML_PREDICTION_ENABLED=true and at least one closed trade with a logged model_prob.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>5-Minute Lifecycle Engine ({{ state.lifecycle_active_windows|length }} active)</h2>
+    <div class="metric"><div class="label">Total P&amp;L</div>
+      <div class="value small {{ 'profit' if state.lifecycle_total_pnl >= 0 else 'loss' }}">${{ "%.4f"|format(state.lifecycle_total_pnl) }}</div>
+    </div>
+    <div class="metric"><div class="label">Win Rate</div><div class="value small">{{ "%.1f"|format(state.lifecycle_win_rate) }}%</div></div>
+    <div class="metric"><div class="label">Markets Traded</div><div class="value small">{{ state.lifecycle_total_trades }}</div></div>
+    {% if state.lifecycle_active_windows %}
+    <table>
+      <tr><th>Asset</th><th>Price to Beat</th><th>Current</th><th>Time Left</th><th>Position</th><th>Size</th><th>PnL</th></tr>
+      {% for w in state.lifecycle_active_windows %}
+      <tr>
+        <td>{{ w.asset|upper }}</td>
+        <td>${{ "%.2f"|format(w.price_to_beat) }}</td>
+        <td>{{ "%.3f"|format(w.current_yes_price) }}</td>
+        <td>{{ "%.0f"|format(w.time_remaining) }}s</td>
+        <td>{{ w.position_side or "-" }}</td>
+        <td>${{ "%.2f"|format(w.position_size_usd) }}</td>
+        <td class="{{ 'ok' if w.pnl_usd >= 0 else 'loss' }}">${{ "%.4f"|format(w.pnl_usd) }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <p style="color: #8b949e;">No active 5-minute market windows right now.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Arbitrage</h2>
+    <div class="metric"><div class="label">P&amp;L</div>
+      <div class="value small {{ 'profit' if state.arb_pnl >= 0 else 'loss' }}">${{ "%.4f"|format(state.arb_pnl) }}</div>
+    </div>
+    <div class="metric"><div class="label">Win Rate</div><div class="value small">{{ "%.1f"|format(state.arb_win_rate) }}%</div></div>
+    <div class="metric"><div class="label">Open</div><div class="value small">{{ state.arb_open_positions }}</div></div>
+    <div class="metric"><div class="label">Closed</div><div class="value small">{{ state.arb_closed_positions }}</div></div>
+    <div class="metric"><div class="label">Opportunities Seen</div><div class="value small">{{ state.arb_opportunities }}</div></div>
   </div>
 
   <div class="card">
@@ -151,15 +285,26 @@ PAGE = """
   </div>
 
   <div class="card">
-    <h2>Recent Trades</h2>
+    <h2>Trade Log (persistent, all sources)</h2>
+    {% if state.trade_log_recent %}
     <table>
-      <tr><th>Market</th><th>Category</th><th>P&amp;L</th><th>Closed</th></tr>
-      {% for t in state.recent_trades %}
-      <tr><td>{{ t.market_id }}</td><td>{{ t.category }}</td>
-          <td class="{{ 'ok' if t.pnl_usd >= 0 else 'loss' }}">${{ "%.2f"|format(t.pnl_usd) }}</td>
-          <td>{{ t.closed_at }}</td></tr>
+      <tr><th>Time</th><th>Asset</th><th>Side</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Strategy</th><th>Won</th></tr>
+      {% for t in state.trade_log_recent %}
+      <tr>
+        <td>{{ t.timestamp[:19] if t.timestamp else "" }}</td>
+        <td>{{ (t.asset or "")|upper }}</td>
+        <td>{{ t.entry_side }}</td>
+        <td>{{ "%.3f"|format(t.entry_price) if t.entry_price is not none else "-" }}</td>
+        <td>{{ "%.3f"|format(t.exit_price) if t.exit_price is not none else "open" }}</td>
+        <td class="{{ 'ok' if (t.pnl_usd or 0) >= 0 else 'loss' }}">${{ "%.4f"|format(t.pnl_usd or 0) }}</td>
+        <td>{{ t.strategy }}</td>
+        <td>{{ "WIN" if t.won else ("LOSS" if t.exit_price is not none else "-") }}</td>
+      </tr>
       {% endfor %}
     </table>
+    {% else %}
+    <p style="color: #8b949e;">No trades logged yet.</p>
+    {% endif %}
   </div>
 
   <script>
@@ -214,15 +359,10 @@ PAPER_PAGE = """
             padding: 0.3rem 0.8rem; border-radius: 4px; }
     nav a:hover { background: #161b22; }
     nav a.active { background: #238636; color: white; }
-    .training-badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px;
-                      font-size: 0.8rem; margin-left: 0.5rem; }
-    .training-on { background: #238636; color: white; }
-    .training-off { background: #30363d; color: #8b949e; }
-    .disabled-overlay { opacity: 0.4; pointer-events: none; }
-    .leaderboard-rank { font-size: 1.2rem; }
-    .rank-1 { color: #ffd700; }
-    .rank-2 { color: #c0c0c0; }
-    .rank-3 { color: #cd7f32; }
+    .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px;
+             font-size: 0.8rem; margin-left: 0.5rem; }
+    .badge-on { background: #238636; color: white; }
+    .badge-off { background: #30363d; color: #8b949e; }
     .analytics-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1rem; }
   </style>
 </head>
@@ -230,20 +370,15 @@ PAPER_PAGE = """
   <nav>
     <a href="/">Dashboard</a>
     <a href="/paper" class="active">Paper Trade (Training)
-      {% if state.training_mode %}
-      <span class="training-badge training-on">ON</span>
-      {% else %}
-      <span class="training-badge training-off">OFF</span>
-      {% endif %}
+      {% if state.training_mode %}<span class="badge badge-on">ON</span>
+      {% else %}<span class="badge badge-off">OFF</span>{% endif %}
     </a>
+    <a href="/logs">Logs</a>
   </nav>
 
   <h1>Paper Trading (Training Mode)
-    {% if state.training_mode %}
-    <span class="training-badge training-on">ACTIVE</span>
-    {% else %}
-    <span class="training-badge training-off">DISABLED</span>
-    {% endif %}
+    {% if state.training_mode %}<span class="badge badge-on">ACTIVE</span>
+    {% else %}<span class="badge badge-off">DISABLED</span>{% endif %}
   </h1>
 
   {% if not state.training_mode %}
@@ -348,17 +483,101 @@ PAPER_PAGE = """
 """
 
 
+LOGS_PAGE = """
+<!doctype html>
+<html>
+<head>
+  <title>Bot Logs</title>
+  <meta http-equiv="refresh" content="10">
+  <style>
+    body { font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 2rem; }
+    h1 { color: #58a6ff; }
+    nav { margin-bottom: 2rem; padding: 0.8rem 0; border-bottom: 1px solid #30363d; }
+    nav a { color: #58a6ff; text-decoration: none; margin-right: 1.5rem; font-size: 1rem;
+            padding: 0.3rem 0.8rem; border-radius: 4px; }
+    nav a:hover { background: #161b22; }
+    nav a.active { background: #238636; color: white; }
+    pre { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1rem;
+          overflow-x: auto; font-size: 0.85rem; line-height: 1.4; white-space: pre-wrap; word-break: break-all; }
+    .line-error { color: #f85149; }
+    .line-warn { color: #d29922; }
+  </style>
+</head>
+<body>
+  <nav>
+    <a href="/">Dashboard</a>
+    <a href="/paper">Paper Trade (Training)</a>
+    <a href="/logs" class="active">Logs</a>
+  </nav>
+  <h1>Bot Logs (last {{ lines|length }} lines)</h1>
+  <pre>{% for line in lines %}<span class="{{ 'line-error' if 'ERROR' in line or 'CRITICAL' in line else ('line-warn' if 'WARNING' in line else '') }}">{{ line }}</span>
+{% endfor %}</pre>
+</body>
+</html>
+"""
+
+
 @app.route("/")
+@require_auth
 def index():
-    return render_template_string(PAGE, state=get_state())
+    return render_template_string(PAGE, state=get_state(), auth_configured=_auth_configured())
 
 
 @app.route("/paper")
+@require_auth
 def paper_page():
     return render_template_string(PAPER_PAGE, state=get_state())
 
 
+@app.route("/logs")
+@require_auth
+def logs_page():
+    n = request.args.get("n", 200, type=int)
+    n = max(10, min(n, 2000))
+    lines = _tail_log(n)
+    return render_template_string(LOGS_PAGE, lines=lines)
+
+
+def _tail_log(n: int):
+    if not os.path.exists(BOT_LOG_PATH):
+        return [f"(no log file found at {BOT_LOG_PATH})"]
+    try:
+        with open(BOT_LOG_PATH, "r", errors="ignore") as f:
+            return [l.rstrip("\n") for l in f.readlines()[-n:]]
+    except Exception as e:
+        return [f"(failed to read log: {e})"]
+
+
+@app.route("/api/logs")
+@require_auth
+def api_logs():
+    n = request.args.get("n", 200, type=int)
+    n = max(10, min(n, 2000))
+    return jsonify({"lines": _tail_log(n)})
+
+
+@app.route("/api/health")
+@require_auth
+def api_health():
+    s = get_state()
+    return jsonify({
+        "status": "halted" if s.halted else "running",
+        "halt_reason": s.halt_reason,
+        "uptime_seconds": round(s.uptime_seconds, 1),
+        "started_at": s.started_at,
+        "mode": s.mode,
+        "training_mode": s.training_mode,
+        "ml_prediction_enabled": s.ml_prediction_enabled,
+        "brti_price": s.brti_price,
+        "brti_tick_count": s.brti_tick_count,
+        "lifecycle_active_windows": len(s.lifecycle_active_windows),
+        "tte_models_fitted": s.tte_models_fitted,
+        "tte_total_models": s.tte_total_models,
+    })
+
+
 @app.route("/api/state")
+@require_auth
 def api_state():
     s = get_state()
     return jsonify({
@@ -377,6 +596,27 @@ def api_state():
         "halted": s.halted,
         "halt_reason": s.halt_reason,
         "open_positions": len(s.open_positions),
+        "brti": {
+            "price": s.brti_price,
+            "spread_bps": s.brti_spread_bps,
+            "exchanges_used": s.brti_exchanges_used,
+            "tick_count": s.brti_tick_count,
+        },
+        "arbitrage": {
+            "pnl": s.arb_pnl,
+            "open_positions": s.arb_open_positions,
+            "closed_positions": s.arb_closed_positions,
+            "win_rate": s.arb_win_rate,
+            "opportunities": s.arb_opportunities,
+        },
+        "lifecycle": {
+            "active_windows": s.lifecycle_active_windows,
+            "total_pnl": s.lifecycle_total_pnl,
+            "win_rate": s.lifecycle_win_rate,
+            "total_trades": s.lifecycle_total_trades,
+        },
+        "model_accuracy": s.model_accuracy,
+        "trade_log_recent": s.trade_log_recent,
         "withdrawal_history": [
             {"amount": w.amount_usd, "destination": w.destination, "status": w.status, "time": str(w.timestamp)}
             for w in s.withdrawal_history
@@ -396,6 +636,7 @@ def api_state():
 
 
 @app.route("/api/withdraw", methods=["POST"])
+@require_auth
 def api_withdraw():
     """Manual withdrawal endpoint. Triggers USDC transfer from the trading wallet."""
     data = request.get_json()
@@ -406,12 +647,10 @@ def api_withdraw():
         return jsonify({"success": False, "message": "Amount must be > $0"})
 
     # Import here to avoid circular imports
-    from risk.risk_manager import RiskManager
     from alerts.notifier import Severity, notifier
 
     # We need to signal to the main loop to execute the withdrawal
     # Store the request in a shared state that main.py picks up
-    from dashboard.state import get_state
     state = get_state()
 
     if not settings.withdrawal_enabled:
@@ -444,6 +683,13 @@ def get_pending_withdrawal():
 
 
 def run():
+    if not _auth_configured():
+        import logging
+        logging.getLogger(__name__).warning(
+            "DASHBOARD_USERNAME/DASHBOARD_PASSWORD not set — dashboard has NO "
+            "authentication. Fine for localhost-only access; do not expose "
+            "this port publicly without setting them."
+        )
     app.run(host=settings.dashboard_host, port=settings.dashboard_port)
 
 

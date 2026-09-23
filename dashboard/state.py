@@ -3,11 +3,15 @@ In-process state holder for dashboard and main.py.
 Tracks compounding metrics, BRTI price, arbitrage P&L,
 TTE model status, and withdrawal history.
 """
+import json
+import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from risk.risk_manager import Position, RiskManager, TradeResult, WithdrawalRecord
+
+_start_time = time.time()
 
 
 @dataclass
@@ -80,6 +84,25 @@ class DashboardState:
     paper_backend: str = "pm_trader"
     paper_analytics: Dict = field(default_factory=dict)
 
+    # 5-minute lifecycle engine (real-time BTC/ETH/SOL/XRP/Gold markets)
+    lifecycle_active_windows: List[Dict] = field(default_factory=list)
+    lifecycle_total_pnl: float = 0.0
+    lifecycle_win_rate: float = 0.0
+    lifecycle_total_trades: int = 0
+    ml_prediction_enabled: bool = False
+
+    # Model accuracy — live Brier score of model_prob vs realized outcome,
+    # computed from trade_log.db, not a backtest number.
+    model_accuracy: Dict = field(default_factory=dict)
+
+    # Full trade history from the persistent SQLite log (survives restarts,
+    # unlike risk_manager.trade_history which is in-memory only).
+    trade_log_recent: List[Dict] = field(default_factory=list)
+
+    # Process/uptime health
+    uptime_seconds: float = 0.0
+    started_at: Optional[str] = None
+
 
 _state = DashboardState()
 
@@ -89,6 +112,8 @@ def update_state(
     brti_engine=None,
     arb_engine=None,
     tte_orchestrator=None,
+    lifecycle_engine=None,
+    trade_logger=None,
 ) -> None:
     global _state
     from config.settings import settings
@@ -125,6 +150,29 @@ def update_state(
         tte_total = tte_stats.get("total_tte_models", 900)
         last_retrain = tte_stats.get("last_full_retrain")
 
+    lc_windows: List[Dict] = []
+    lc_pnl = 0.0
+    lc_wr = 0.0
+    lc_trades = 0
+    if lifecycle_engine:
+        try:
+            lc_windows = lifecycle_engine.get_active_windows()
+            lc_windows = [w.to_dict() for w in lc_windows]
+        except Exception:
+            lc_windows = []
+        lc_pnl = lifecycle_engine.get_total_pnl()
+        lc_stats = lifecycle_engine.stats
+        lc_wr = lc_stats.win_rate
+        lc_trades = lc_stats.total_markets_traded
+
+    accuracy = compute_model_accuracy(trade_logger) if trade_logger else {}
+    trade_log_recent = []
+    if trade_logger:
+        try:
+            trade_log_recent = trade_logger.get_recent_trades(limit=25)
+        except Exception:
+            trade_log_recent = []
+
     _state = DashboardState(
         bankroll=risk_manager.bankroll,
         principal=risk_manager.principal,
@@ -160,7 +208,59 @@ def update_state(
         tte_total_models=tte_total,
         last_retrain=last_retrain,
         active_strategy=settings.strategy,
+        lifecycle_active_windows=lc_windows,
+        lifecycle_total_pnl=lc_pnl,
+        lifecycle_win_rate=lc_wr,
+        lifecycle_total_trades=lc_trades,
+        ml_prediction_enabled=settings.ml_prediction_enabled,
+        model_accuracy=accuracy,
+        trade_log_recent=trade_log_recent,
+        uptime_seconds=time.time() - _start_time,
+        started_at=datetime.fromtimestamp(_start_time, tz=timezone.utc).isoformat(),
     )
+
+
+def compute_model_accuracy(trade_logger, limit: int = 500) -> Dict:
+    """
+    Live Brier score of the model's predicted probability (logged in each
+    trade's metadata_json as `model_prob` — see
+    strategies/lifecycle_engine.py::_execute_trade) vs the realized outcome,
+    from the persistent trade log. This is a real-world calibration check,
+    not a backtest number — only trades where a prediction was actually
+    logged (i.e. ML_PREDICTION_ENABLED was on) are counted.
+    """
+    if trade_logger is None:
+        return {}
+    try:
+        rows = trade_logger.get_recent_trades(limit=limit)
+    except Exception:
+        return {}
+
+    scored = []
+    for r in rows:
+        if r.get("exit_price") is None:
+            continue
+        try:
+            meta = json.loads(r.get("metadata_json") or "{}")
+        except (TypeError, ValueError):
+            continue
+        p = meta.get("model_prob")
+        if p is None:
+            continue
+        outcome = 1.0 if r.get("won") else 0.0
+        scored.append((float(p), outcome))
+
+    if not scored:
+        return {"n_predictions": 0}
+
+    brier = sum((p - y) ** 2 for p, y in scored) / len(scored)
+    baseline_brier = sum((0.5 - y) ** 2 for _, y in scored) / len(scored)
+    return {
+        "n_predictions": len(scored),
+        "brier_score": round(brier, 4),
+        "baseline_brier_score": round(baseline_brier, 4),
+        "better_than_baseline": brier < baseline_brier,
+    }
 
 
 def get_state() -> DashboardState:

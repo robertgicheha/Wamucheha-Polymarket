@@ -25,13 +25,17 @@ Three-layer architecture:
 """
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Tuple
 
+from scipy.stats import norm
+
 from config.settings import settings
+from data.btc_tick_buffer import build_feature_frame
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +187,8 @@ class FiveMinuteLifecycleEngine:
         orderbook_arb=None,
         risk_manager=None,
         trade_logger=None,
+        tte_orchestrator=None,
+        brti_engine=None,
     ):
         self.bankroll = bankroll
         self.initial_bankroll = bankroll
@@ -194,6 +200,11 @@ class FiveMinuteLifecycleEngine:
         self.orderbook_arb = orderbook_arb
         self.risk_manager = risk_manager
         self.trade_logger = trade_logger
+        # Real BTC prediction path (gated by settings.ml_prediction_enabled).
+        # When absent/disabled/untrained, _get_strategy_signal falls back to
+        # the market-price heuristic instead of trading blind.
+        self.tte_orchestrator = tte_orchestrator
+        self.brti_engine = brti_engine
 
         self._market_windows: Dict[str, MarketWindow] = {}
         self._current_market: Optional[MarketWindow] = None
@@ -317,8 +328,11 @@ class FiveMinuteLifecycleEngine:
             # Gap is the difference between current mid and 0.5 (neutral)
             window.gap = mid - 0.5
 
-        # Get strategy signal
-        if self._strategy and window.orderbook_snapshot:
+        # Get strategy signal (skip new entries if the circuit breaker has
+        # tripped — risk_manager is otherwise unused by this engine, which
+        # meant a halted account never actually stopped 5-min-market entries)
+        risk_ok = self.risk_manager is None or not getattr(self.risk_manager, "halted", False)
+        if self._strategy and window.orderbook_snapshot and risk_ok:
             signal = self._get_strategy_signal(window)
             window.strategy_signal = signal
 
@@ -409,6 +423,8 @@ class FiveMinuteLifecycleEngine:
                                 "asset": window.asset,
                                 "entry_side": window.position_side,
                                 "market_duration": window.end_time - window.start_time,
+                                "won": window.won,
+                                "final_price": final_price,
                             },
                         )
                 except Exception as e:
@@ -498,34 +514,43 @@ class FiveMinuteLifecycleEngine:
         if not self._strategy or not window.orderbook_snapshot:
             return None
 
-        # Build extra context for the strategy
+        btc_signal = self._compute_btc_signal(window) if window.asset == "btc" else None
+        orderbook_momentum = self._compute_momentum(window)
+
+        momentum = btc_signal["momentum"] if btc_signal else orderbook_momentum
+        z_score = btc_signal["z_score"] if btc_signal else 0.0
+        volatility = btc_signal["volatility"] if btc_signal else 0.01
+        confidence = btc_signal["confidence"] if btc_signal else 0.5
+
         extra = {
-            "momentum": self._compute_momentum(window),
-            "z_score": 0.0,
-            "confidence": 0.5,
+            "momentum": momentum,
+            "z_score": z_score,
+            "price_trend": momentum,
+            "price_vs_ma": z_score,
+            "confidence": confidence,
             "orderbook_imbalance": window.orderbook_snapshot.get("imbalance", 0),
             "spread_bps": window.orderbook_snapshot.get("spread_bps", 0),
             "time_remaining": window.time_remaining,
             "progress_pct": window.progress_pct,
         }
 
-        # For 5-minute markets, the model probability is derived from
-        # the orderbook mid price and the gap
-        mid = window.current_yes_price
-        model_prob = mid  # Use mid as base probability estimate
-
-        # Adjust model_prob based on gap (price vs price_to_beat)
-        if window.price_to_beat > 0:
-            # If current price is above price_to_beat, YES is more likely
-            gap_pct = (window.current_yes_price - 0.5) * 2  # normalize to [-1, 1]
-            model_prob = max(0.01, min(0.99, 0.5 + gap_pct * 0.3))
+        if btc_signal and btc_signal.get("model_prob") is not None:
+            model_prob = btc_signal["model_prob"]
+        else:
+            # Fallback heuristic — used when the real ML path is disabled,
+            # untrained for this TTE yet, or the asset has no BTC pipeline.
+            mid = window.current_yes_price
+            model_prob = mid
+            if window.price_to_beat > 0:
+                gap_pct = (window.current_yes_price - 0.5) * 2  # normalize to [-1, 1]
+                model_prob = max(0.01, min(0.99, 0.5 + gap_pct * 0.3))
 
         decision = self._strategy.should_trade(
             model_prob=model_prob,
             market_price=window.current_yes_price,
             bankroll=self.bankroll,
             tte_seconds=int(window.time_remaining),
-            volatility=0.01,  # Will be replaced with real volatility
+            volatility=volatility,
             extra=extra,
         )
 
@@ -537,8 +562,92 @@ class FiveMinuteLifecycleEngine:
                 "confidence": decision.confidence,
                 "edge": decision.edge,
                 "reason": decision.reason,
+                "model_prob": model_prob,
             }
         return {"should_trade": False}
+
+    def _compute_btc_signal(self, window: MarketWindow) -> Optional[Dict]:
+        """
+        Real BTC momentum/z-score/volatility from BRTI tick history, plus —
+        when ML_PREDICTION_ENABLED and the TTE model for this TTE has been
+        trained — a genuine model probability of resolving YES, replacing
+        the market-price-echo heuristic.
+        """
+        if self.brti_engine is None:
+            return None
+        last_tick = self.brti_engine.last_tick
+        if last_tick is None:
+            return None
+
+        history = self.brti_engine.get_price_history(120)
+        if len(history) < 20:
+            return None
+
+        prices = [p for _, p in history]
+        current_price = last_tick.brti_price
+        mean = sum(prices) / len(prices)
+        variance = sum((p - mean) ** 2 for p in prices) / len(prices)
+        std = variance ** 0.5
+        z_score = (current_price - mean) / std if std > 0 else 0.0
+        momentum = (current_price - prices[0]) / prices[0] if prices[0] else 0.0
+        volatility = self.brti_engine.get_volatility(60) or 0.0
+
+        result = {
+            "momentum": momentum,
+            "z_score": z_score,
+            "volatility": volatility,
+            "confidence": 0.5,
+            "model_prob": None,
+        }
+
+        if not settings.ml_prediction_enabled or self.tte_orchestrator is None:
+            return result
+
+        tte = max(1, min(900, int(window.time_remaining)))
+        model_set = self.tte_orchestrator.tte_models.get(tte)
+        if model_set is None or not model_set.lr_baseline.fitted:
+            logger.debug(
+                "TTE model for tte=%ds not trained yet, using fallback heuristic", tte,
+            )
+            return result
+
+        features = build_feature_frame(self.brti_engine)
+        if features is None:
+            return result
+
+        prediction = self.tte_orchestrator.predict(features, tte)
+        tte_prob = prediction.get("probability", 0.5)
+        result["confidence"] = prediction.get("confidence", 0.5)
+        result["model_prob"] = self._tte_prob_to_yes_probability(
+            tte_prob, current_price, window.price_to_beat, volatility, tte,
+        )
+        return result
+
+    @staticmethod
+    def _tte_prob_to_yes_probability(
+        tte_prob: float,
+        current_price: float,
+        price_to_beat: float,
+        vol_per_second: float,
+        tte_seconds: int,
+    ) -> float:
+        """
+        Convert the TTE model's self-relative prediction ("will price be
+        higher than it is right now, `tte_seconds` from now") into
+        P(price at window expiry > price_to_beat) by combining it with how
+        far the current price already sits from price_to_beat, scaled by
+        realized volatility. Same lognormal / normal-CDF approach as
+        ml/engine.py::EnsembleEngine.predict's GARCH branch, but using the
+        TTE model's directional read as the drift term instead of a GARCH
+        volatility forecast.
+        """
+        if current_price <= 0 or price_to_beat <= 0:
+            return 0.5
+        sigma = max(vol_per_second, 1e-6) * math.sqrt(max(tte_seconds, 1))
+        gap = math.log(current_price / price_to_beat)
+        drift = (tte_prob - 0.5) * 2 * sigma
+        d = (gap + drift) / sigma
+        return float(max(0.01, min(0.99, norm.cdf(d))))
 
     def _execute_trade(self, window: MarketWindow, signal: Dict):
         """Execute a trade based on strategy signal."""
@@ -590,6 +699,7 @@ class FiveMinuteLifecycleEngine:
                         "price_to_beat": window.price_to_beat,
                         "signal_edge": signal.get("edge", 0),
                         "signal_reason": signal.get("reason", ""),
+                        "model_prob": signal.get("model_prob"),
                     },
                 )
             except Exception as e:

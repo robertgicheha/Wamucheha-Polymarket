@@ -64,10 +64,15 @@ def _init_brti_engine():
     return engine, ws_instances
 
 
-def _init_tte_orchestrator():
-    """Initialize TTE training orchestrator."""
+def _init_tte_orchestrator(brti_engine):
+    """Initialize TTE training orchestrator, wired to train on live BRTI history."""
     from ml.tte_orchestrator import TTETrainingOrchestrator
-    orchestrator = TTETrainingOrchestrator()
+    from data.btc_tick_buffer import raw_price_frame
+
+    def _data_provider():
+        return raw_price_frame(brti_engine)
+
+    orchestrator = TTETrainingOrchestrator(data_provider=_data_provider)
     loaded = orchestrator.load_all()
     logger.info("TTE orchestrator: loaded %d model sets", loaded)
     return orchestrator
@@ -104,7 +109,10 @@ def _init_websocket_connector():
     return ws
 
 
-def _init_lifecycle_engine(arb_engine, orderbook_arb, risk_manager, trade_logger=None):
+def _init_lifecycle_engine(
+    arb_engine, orderbook_arb, risk_manager, trade_logger=None,
+    tte_orchestrator=None, brti_engine=None,
+):
     """Initialize 5-minute market lifecycle engine."""
     from strategies.lifecycle_engine import FiveMinuteLifecycleEngine
     return FiveMinuteLifecycleEngine(
@@ -113,6 +121,8 @@ def _init_lifecycle_engine(arb_engine, orderbook_arb, risk_manager, trade_logger
         orderbook_arb=orderbook_arb,
         risk_manager=risk_manager,
         trade_logger=trade_logger,
+        tte_orchestrator=tte_orchestrator,
+        brti_engine=brti_engine,
     )
 
 
@@ -131,13 +141,66 @@ def _init_lifecycle_engine(arb_engine, orderbook_arb, risk_manager, trade_logger
 #     return GnosisSafeRelayer(config)
 
 
+def _fast_trading_loop(lifecycle_engine, stop_event: threading.Event) -> None:
+    """
+    Ticks the 5-minute lifecycle engine at settings.orderbook_update_interval
+    (default 1s), independent of the main loop's slower
+    signal_check_interval_seconds (default 300s — the length of an entire
+    market window). Without this, a 5-min market got ~1 tick for its whole
+    lifetime and take-profit/stop-loss/entries never got a real chance to
+    fire regardless of what fed the model.
+    """
+    interval = settings.orderbook_update_interval
+    logger.info("Fast trading loop started (interval=%.1fs)", interval)
+    while not stop_event.is_set():
+        tick_start = time.time()
+        try:
+            lifecycle_engine.tick()
+        except Exception as e:
+            logger.error("Fast trading loop tick failed: %s", e)
+        elapsed = time.time() - tick_start
+        stop_event.wait(max(0.0, interval - elapsed))
+    logger.info("Fast trading loop stopped")
+
+
 def _run_async(coro):
-    """Run an async coroutine in a new event loop (for non-async contexts)."""
+    """
+    Run a one-shot async coroutine to completion in a throwaway event loop.
+    Only safe for coroutines that fully finish their work before returning
+    (e.g. a single HTTP call) — NOT for anything that schedules a background
+    task meant to outlive the call (asyncio.create_task inside it), because
+    this loop is closed immediately after, orphaning any such task before it
+    ever runs a second iteration. Use `_start_background_loop` +
+    `_run_on_background_loop` for those instead (BRTI engine, exchange/PM
+    WebSockets, TTE retrain loop all fall in that category).
+    """
     loop = asyncio.new_event_loop()
     try:
         return loop.run_until_complete(coro)
     finally:
         loop.close()
+
+
+def _start_background_loop() -> asyncio.AbstractEventLoop:
+    """
+    Start one persistent asyncio event loop on a dedicated daemon thread,
+    for the lifetime of the process. Long-running async components (BRTI
+    engine tick loop, exchange WebSocket reconnect loops, Polymarket
+    WebSocket, TTE retrain loop) get scheduled on this loop via
+    `_run_on_background_loop` so they keep running for the bot's lifetime,
+    instead of being silently orphaned by a throwaway loop that closes right
+    after scheduling them.
+    """
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True, name="asyncio-bg-loop")
+    thread.start()
+    return loop
+
+
+def _run_on_background_loop(loop, coro, timeout: float = 30.0):
+    """Schedule `coro` on the persistent background loop and wait for it to start/finish."""
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result(timeout=timeout)
 
 
 def _write_balance_state(risk_manager, arb_engine=None, lifecycle_engine=None, paper_broker=None):
@@ -207,25 +270,24 @@ def main():
     trade_logger = TradeLogger()
 
     brti_engine, brti_ws = _init_brti_engine()
-    tte_orchestrator = _init_tte_orchestrator()
+    tte_orchestrator = _init_tte_orchestrator(brti_engine)
     arb_engine = _init_arbitrage_engine(bankroll=risk_manager.bankroll)
     orderbook_arb = _init_orderbook_arb(bankroll=risk_manager.bankroll)
     pmxt = _init_pmxt_wrapper()
     strategies = _init_strategies()
-    gnosis_relayer = _init_gnosis_relayer()
     ws_connector = None
     lifecycle_engine = None
 
-    # # Kalshi settlement calculator (commented out)
-    # from data.brti.kalshi_settlement import KalshiSettlementCalculator
-    # settlement_calc = KalshiSettlementCalculator()
-    # brti_engine.on_tick(settlement_calc.on_brti_tick)
-    settlement_calc = None
-
     # ── Initialize lifecycle engine (5-min markets) ───────────────────
     if settings.lifecycle_engine_enabled:
-        lifecycle_engine = _init_lifecycle_engine(arb_engine, orderbook_arb, risk_manager, trade_logger)
-        logger.info("Lifecycle engine initialized for 5-minute markets")
+        lifecycle_engine = _init_lifecycle_engine(
+            arb_engine, orderbook_arb, risk_manager, trade_logger,
+            tte_orchestrator=tte_orchestrator, brti_engine=brti_engine,
+        )
+        logger.info(
+            "Lifecycle engine initialized for 5-minute markets (ML prediction: %s)",
+            "enabled" if settings.ml_prediction_enabled else "disabled (fallback heuristic)",
+        )
 
     # ── Initialize WebSocket connector ────────────────────────────────
     if settings.lifecycle_engine_enabled:
@@ -268,6 +330,15 @@ def main():
     elif not settings.training_mode:
         logger.info("TRAINING_MODE=false — paper trading disabled, preparing for live trading")
 
+    # ── Persistent background event loop ──────────────────────────────
+    # BRTI's tick loop, the exchange WebSocket reconnect loops, the
+    # Polymarket WebSocket, and the TTE retrain loop are all long-running
+    # asyncio tasks meant to outlive the call that starts them. Scheduling
+    # them via the old throwaway-loop `_run_async` would close the loop
+    # (and orphan those tasks) the instant the start-up coroutine returned —
+    # they need one event loop that stays alive for the process lifetime.
+    bg_loop = _start_background_loop()
+
     # ── Start BRTI engine ─────────────────────────────────────────────
     async def _start_brti():
         for ws in brti_ws:
@@ -275,14 +346,17 @@ def main():
         await brti_engine.start()
 
     logger.info("Starting BRTI engine with %d exchange feeds...", len(brti_ws))
-    _run_async(_start_brti())
+    _run_on_background_loop(bg_loop, _start_brti())
+
+    # ── Start TTE retrain loop ─────────────────────────────────────────
+    _run_on_background_loop(bg_loop, tte_orchestrator.start())
 
     # ── Start WebSocket feeds ─────────────────────────────────────────
     if ws_connector and settings.lifecycle_engine_enabled:
         async def _start_ws():
             await ws_connector.start_async()
         try:
-            _run_async(_start_ws())
+            _run_on_background_loop(bg_loop, _start_ws())
             logger.info("Polymarket WebSocket feeds started")
         except Exception as e:
             logger.warning("WebSocket start failed: %s (will use REST fallback)", e)
@@ -293,6 +367,18 @@ def main():
         threading.Thread(target=run_dashboard, daemon=True).start()
     except Exception as e:
         logger.warning("Dashboard failed to start: %s", e)
+
+    # ── Start fast trading loop (5-min markets) ───────────────────────
+    fast_loop_stop = threading.Event()
+    fast_loop_thread = None
+    if lifecycle_engine:
+        fast_loop_thread = threading.Thread(
+            target=_fast_trading_loop,
+            args=(lifecycle_engine, fast_loop_stop),
+            daemon=True,
+            name="fast-trading-loop",
+        )
+        fast_loop_thread.start()
 
     # ── Start scheduler (5-min pings + hourly reports) ────────────────
     scheduler = BotScheduler(
@@ -330,9 +416,6 @@ def main():
     # ── Main loop ─────────────────────────────────────────────────────
     cycle_count = 0
     last_report_cycle = 0
-    last_strategy_eval = 0
-    last_market_scan = 0
-    best_strategy_name = settings.strategy
 
     try:
         while True:
@@ -351,98 +434,13 @@ def main():
             # ── 2. Update external price feeds for orderbook arb ──────
             orderbook_arb.update_external_price("BTC", current_btc_price)
 
-            # ── 3-5. Trade decision (strategy-based, lifecycle engine handles its own) ──
-            if settlement_calc is not None:
-                active_contracts = settlement_calc.get_active_contracts()
-                for contract in active_contracts:
-                    tte = int(contract.time_to_close_seconds)
-                    if tte <= 0 or tte > 900:
-                        continue
-
-                    import pandas as pd
-                    import numpy as np
-                    features = pd.DataFrame(
-                        np.random.randn(1, 80),
-                        columns=[f"f{i}" for i in range(80)],
-                    )
-
-                    prediction = tte_orchestrator.predict(features, tte)
-
-                    if cycle_count - last_strategy_eval >= 3600:
-                        best_strategy_name = settings.strategy
-                        last_strategy_eval = cycle_count
-
-                    strategy = strategies.get(best_strategy_name)
-                    if strategy is None:
-                        continue
-
-                    decision = strategy.should_trade(
-                        model_prob=prediction["probability"],
-                        market_price=contract.last_yes_price or 0.5,
-                        bankroll=risk_manager.bankroll,
-                        tte_seconds=tte,
-                        volatility=brti_engine.get_volatility(60) or 0.01,
-                        extra={
-                            "momentum": 0.0,
-                            "z_score": 0.0,
-                            "confidence": prediction.get("confidence", 0.5),
-                        },
-                    )
-
-                    if decision.should_trade and decision.size_usd > 0:
-                        if not risk_manager.can_open_new_position():
-                            continue
-
-                        category = "crypto"
-                        size_usd = min(
-                            decision.size_usd,
-                            risk_manager.max_position_size(category),
-                        )
-
-                        if settings.training_mode and paper_broker:
-                            fill = paper_broker.simulate_order(
-                                market_id=contract.ticker,
-                                category=category,
-                                side=decision.side,
-                                price=contract.last_yes_price or 0.5,
-                            )
-
-                            trade_id = trade_logger.log_entry(
-                                condition_id=contract.ticker,
-                                asset="btc",
-                                side=decision.side,
-                                price=fill.filled_price,
-                                size_usd=size_usd,
-                                strategy=best_strategy_name,
-                                source="lifecycle",
-                                market_question=getattr(contract, 'question', ''),
-                                bankroll_after=risk_manager.bankroll,
-                                metadata={
-                                    "edge": decision.edge,
-                                    "model_prob": prediction["probability"],
-                                    "market_price": contract.last_yes_price or 0.5,
-                                    "tte": tte,
-                                },
-                            )
-
-                            notifier.send_training(
-                                f"[NL-PAPER] \u26a0\ufe0f Inflight bet recovered\n"
-                                f"Market: {contract.ticker}\n"
-                                f"Side: {decision.side} | PM: {decision.side} | "
-                                f"edge={decision.edge:+.4f}\n"
-                                f"Bankroll: ${risk_manager.bankroll:.2f}\n"
-                                f"Trade ID: {trade_id}",
-                                Severity.INFO,
-                            )
-
-                        logger.info(
-                            "[NL-PAPER] \u26a0\ufe0f Inflight bet recovered\n"
-                            "Market: %s\n"
-                            "Side: %s | PM: %s | edge=%+.4f\n"
-                            "Bankroll: $%.2f",
-                            contract.ticker, decision.side, decision.side,
-                            decision.edge, risk_manager.bankroll,
-                        )
+            # ── 3-5. Trade decision for 5-min markets ──────────────────
+            # Handled by the fast trading-loop thread (_fast_trading_loop),
+            # which ticks lifecycle_engine at settings.orderbook_update_interval
+            # instead of once per slow cycle here, using real BRTI-derived
+            # features (strategies/lifecycle_engine.py::_compute_btc_signal)
+            # rather than the placeholder random-noise features this dead
+            # Kalshi-settlement-only block used to feed the model.
 
             # ── 6. Cross-platform arbitrage scan ──────────────────────
             pm_markets = _run_async(pmxt.get_crypto_markets())
@@ -509,11 +507,11 @@ def main():
                         )
 
             # ── 8. Lifecycle engine tick (5-min markets) ──────────────
-            if lifecycle_engine:
-                try:
-                    lifecycle_engine.tick()
-                except Exception as e:
-                    logger.error("Lifecycle engine tick failed: %s", e)
+            # Handled by the fast trading-loop thread (see
+            # _fast_trading_loop) at settings.orderbook_update_interval,
+            # not here — this slow loop's cadence (signal_check_interval_
+            # seconds, default 300s) is the length of an entire market
+            # window, so ticking here gave each window ~1 chance to trade.
 
             # ── 9. Stop-loss check ────────────────────────────────────
             # (handled by risk_manager in paper_broker)
@@ -538,7 +536,14 @@ def main():
             # ── 12. Dashboard state update ────────────────────────────
             try:
                 from dashboard.state import update_state, update_paper_state
-                update_state(risk_manager)
+                update_state(
+                    risk_manager,
+                    brti_engine=brti_engine,
+                    arb_engine=arb_engine,
+                    tte_orchestrator=tte_orchestrator,
+                    lifecycle_engine=lifecycle_engine,
+                    trade_logger=trade_logger,
+                )
                 if paper_broker:
                     update_paper_state(paper_broker)
             except Exception:
@@ -568,15 +573,19 @@ def main():
     finally:
         # Cleanup
         scheduler.stop()
-        _run_async(brti_engine.stop())
+        fast_loop_stop.set()
+        if fast_loop_thread:
+            fast_loop_thread.join(timeout=5)
+        _run_on_background_loop(bg_loop, brti_engine.stop())
         for ws in brti_ws:
             ws.stop()
-        _run_async(tte_orchestrator.stop())
+        _run_on_background_loop(bg_loop, tte_orchestrator.stop())
         if ws_connector:
             try:
-                _run_async(ws_connector.stop())
-            except Exception:
-                pass
+                ws_connector.stop()
+            except Exception as e:
+                logger.warning("WebSocket connector stop failed: %s", e)
+        bg_loop.call_soon_threadsafe(bg_loop.stop)
         # Final database backup
         try:
             trade_logger.backup()
@@ -596,7 +605,7 @@ def _send_profit_report(risk_manager, arb_engine=None, brti_engine=None, lifecyc
         f"Profit: ${summary['total_profit']:.2f} ({summary['profit_pct']:.1f}%)",
         f"Withdrawn: ${summary['total_withdrawn']:.2f}",
         f"Drawdown: {summary['drawdown_pct']:.1f}%",
-        f"Growth Rate: {summary['compound_growth_rate']:.1f}% (ann.)",
+        f"Growth Rate: {summary['compound_growth_rate_annualized']:.1f}% (ann.)",
         f"Trades: {summary['total_trades']} (W:{summary['total_wins']} L:{summary['total_losses']})",
         f"Win Rate: {summary['win_rate']:.1f}%",
         f"Compounding: {'ON' if settings.compound_enabled else 'OFF'}",

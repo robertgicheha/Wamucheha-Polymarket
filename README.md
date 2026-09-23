@@ -58,3 +58,19 @@ cp config/.env.example config/.env
 pip install -r requirements.txt
 python backtest/run_backtest.py --category crypto   # start here
 ```
+
+## BTC 5-minute prediction models
+
+The 5-minute crypto lifecycle engine (`strategies/lifecycle_engine.py`) can
+trade on real ML predictions from the TTE model bank (`ml/tte_orchestrator.py`)
+instead of its market-price-echo fallback heuristic. Since the live BRTI tick
+buffer starts empty, pretrain on historical data first:
+
+```bash
+python scripts/bootstrap_tte_models.py   # one-time, ~14 days of 1m BTC klines by default
+```
+
+Check the printed Brier scores (below 0.25 = better than a coin flip) before
+setting `ML_PREDICTION_ENABLED=true` in `.env`. Until that flag is set, or for
+any TTE bin that isn't trained yet, the engine falls back to the previous
+heuristic rather than trading on an untrained model.

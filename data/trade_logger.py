@@ -242,7 +242,7 @@ class TradeLogger:
 
                 # Calculate PnL percentage from entry
                 row = conn.execute(
-                    "SELECT size_usd, entry_price FROM trades WHERE trade_id=?",
+                    "SELECT size_usd, entry_price, metadata_json FROM trades WHERE trade_id=?",
                     (trade_id,),
                 ).fetchone()
                 if row and row["entry_price"] > 0:
@@ -250,6 +250,18 @@ class TradeLogger:
                     conn.execute(
                         "UPDATE trades SET pnl_pct=? WHERE trade_id=?",
                         (pnl_pct, trade_id),
+                    )
+
+                # Merge exit metadata into the entry's metadata_json rather
+                # than overwriting it, so entry-time fields (e.g. the
+                # predicted model_prob, for later Brier-score analysis)
+                # survive alongside exit-time fields (e.g. final price).
+                if metadata and row:
+                    existing_meta = json.loads(row["metadata_json"] or "{}")
+                    existing_meta.update(metadata)
+                    conn.execute(
+                        "UPDATE trades SET metadata_json=? WHERE trade_id=?",
+                        (json.dumps(existing_meta), trade_id),
                     )
 
                 # Log PnL transaction
