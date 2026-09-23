@@ -164,15 +164,21 @@ class BRTIEngine:
             weighted_mid_bid * utilized_bid + weighted_mid_ask * utilized_ask
         ) / total_volume
 
-        # Validation: check bid/ask divergence
+        # Depth-weighted side spread (a feature, not a health signal: each side
+        # averages up to deviation_threshold deep, so it sits ~30 bps apart
+        # structurally for BTC).
         spread_bps = abs(weighted_mid_ask - weighted_mid_bid) / brti_price * 10000
 
+        # Validation: the consolidated top-of-book must be tight and not
+        # materially crossed — a wide or crossed top means a stale/broken feed.
+        top_bid, top_ask = bids[0]["price"], asks[0]["price"]
+        top_spread_bps = (top_ask - top_bid) / ((top_ask + top_bid) / 2) * 10000
         if self.validation_enabled:
-            if spread_bps > self.max_divergence_bps:
+            if abs(top_spread_bps) > self.max_divergence_bps:
                 logger.warning(
-                    "BRTI validation: spread %.2f bps exceeds max %.2f bps — "
-                    "divergence too high, skipping tick",
-                    spread_bps, self.max_divergence_bps,
+                    "BRTI validation: top-of-book spread %.2f bps exceeds max %.2f bps — "
+                    "stale or crossed feed, skipping tick",
+                    top_spread_bps, self.max_divergence_bps,
                 )
                 self._validation_failures += 1
                 return None

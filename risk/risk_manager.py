@@ -282,6 +282,25 @@ class RiskManager:
         self.check_circuit_breaker()
         return result
 
+    def record_closed_trade(self, market_id: str, category: str, pnl_usd: float) -> TradeResult:
+        """
+        Record a trade that was opened and closed outside open_position()
+        (the up/down lifecycle engine), so streaks, drawdown and the circuit
+        breaker see real results. Raises CircuitBreakerTripped on a trip.
+        """
+        self.bankroll += pnl_usd
+        if self.bankroll > self.peak_bankroll:
+            self.peak_bankroll = self.bankroll
+        if self.bankroll - self.principal > self.all_time_high_pnl:
+            self.all_time_high_pnl = self.bankroll - self.principal
+        self.consecutive_losses = self.consecutive_losses + 1 if pnl_usd < 0 else 0
+        result = TradeResult(
+            market_id=market_id, category=category, pnl_usd=pnl_usd, closed_at=datetime.utcnow()
+        )
+        self.trade_history.append(result)
+        self.check_circuit_breaker()
+        return result
+
     # ---- Manual withdrawal ----
 
     def can_withdraw(self, amount_usd: float) -> bool:

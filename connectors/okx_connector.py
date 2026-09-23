@@ -3,11 +3,16 @@ OKX connector. Dual role:
   1. Capital movement: buy USDC on OKX, withdraw to Polygon wallet for Polymarket funding
   2. Market data: OHLCV candles + funding rates for the crypto signal pipeline
 
-Install: pip install python-okx
+No SDK needed: public endpoints are plain REST and private ones are signed
+here with HMAC-SHA256 (OKX v5 auth).
 """
+import base64
+import hashlib
+import hmac
+import json
 import logging
-import time
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
 
 import requests
 
@@ -21,24 +26,8 @@ class OKXConnector:
         self.api_key = settings.okx_api_key
         self.api_secret = settings.okx_api_secret
         self.api_passphrase = settings.okx_api_passphrase
-        self._client = None
         self._base_url = "https://www.okx.com"
         self._session = requests.Session()
-
-    def _get_client(self):
-        """Lazily initialize the OKX SDK client (for authenticated endpoints)."""
-        if self._client is None:
-            from okx.market_data import MarketAPI
-            from okx.account import AccountAPI
-            self._client = {
-            "account": AccountAPI(
-                self.api_key, self.api_secret, self.api_passphrase, False, "1"
-            ),
-            "market": MarketAPI(
-                self.api_key, self.api_secret, self.api_passphrase, False, "1"
-            ),
-        }
-        return self._client
 
     # ── Market data (public, no auth needed) ──────────────────────────
 
@@ -178,57 +167,104 @@ class OKXConnector:
             logger.error("OKX ticker request failed: %s", e)
             return None
 
-    # ── Account / funding (authenticated) ──────────────────────────────
+    # ── Account / funding (authenticated, signed REST) ─────────────────
+    #
+    # Requirements on the OKX side:
+    #   - API key with "Read" + "Withdraw" permission, IP-whitelisted to the
+    #     bot host (OKX error 50110 = request IP not on the whitelist)
+    #   - FUNDING_DEPOSIT_ADDRESS added to the withdrawal address book
+    #   - USDC sitting in the FUNDING account (not the trading account)
+
+    def _signed(self, method: str, path: str, body: Optional[Dict] = None) -> Dict:
+        if not (self.api_key and self.api_secret and self.api_passphrase):
+            raise RuntimeError("OKX API credentials are not configured")
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        payload = json.dumps(body, separators=(",", ":")) if body else ""
+        prehash = f"{ts}{method}{path}{payload}"
+        signature = base64.b64encode(
+            hmac.new(self.api_secret.encode(), prehash.encode(), hashlib.sha256).digest()
+        ).decode()
+        headers = {
+            "OK-ACCESS-KEY": self.api_key,
+            "OK-ACCESS-SIGN": signature,
+            "OK-ACCESS-TIMESTAMP": ts,
+            "OK-ACCESS-PASSPHRASE": self.api_passphrase,
+            "Content-Type": "application/json",
+        }
+        resp = self._session.request(
+            method, f"{self._base_url}{path}", headers=headers, data=payload or None, timeout=15
+        )
+        data = resp.json()
+        if data.get("code") != "0":
+            raise OKXAPIError(data.get("code", "?"), data.get("msg", resp.text[:200]))
+        return data
+
+    def get_api_permissions(self) -> Dict:
+        """Permissions and IP whitelist of the configured API key."""
+        cfg = self._signed("GET", "/api/v5/account/config")["data"][0]
+        return {"perm": cfg.get("perm", ""), "ip": cfg.get("ip", ""), "label": cfg.get("label", "")}
 
     def get_usdc_balance(self) -> float:
-        """Query OKX account balance for USDC."""
-        try:
-            client = self._get_client()
-            result = client["account"].get_account_balance()
-            for detail in result.data[0].details:
-                if detail.ccy == "USDC":
-                    return float(detail.availBal)
-            return 0.0
-        except Exception as e:
-            logger.error("OKX balance query failed: %s", e)
-            return 0.0
+        """Available USDC in the OKX FUNDING account (withdrawals come from here)."""
+        data = self._signed("GET", "/api/v5/asset/balances?ccy=USDC")["data"]
+        return sum(float(d.get("availBal", 0) or 0) for d in data if d.get("ccy") == "USDC")
 
-    def withdraw_to_polygon(self, amount_usd: float, to_address: str) -> str:
+    def get_polygon_usdc_chain(self) -> Dict:
         """
-        Submit a USDC withdrawal from OKX to a Polygon-network address.
-        This is the funding step: OKX -> your Polymarket-linked wallet.
-        Returns withdrawal ID for tracking.
+        Resolve OKX's chain identifier for native USDC on Polygon (e.g.
+        "USDC-Polygon") plus its withdrawal fee / minimum, instead of
+        hard-coding a name OKX has changed before.
+        """
+        chains = self._signed("GET", "/api/v5/asset/currencies?ccy=USDC")["data"]
+        candidates = [
+            c for c in chains
+            if "polygon" in c.get("chain", "").lower() and "bridged" not in c.get("chain", "").lower()
+        ]
+        if not candidates:
+            raise RuntimeError(f"OKX offers no Polygon USDC chain: {[c.get('chain') for c in chains]}")
+        c = candidates[0]
+        return {
+            "chain": c["chain"],
+            "can_withdraw": bool(c.get("canWd")),
+            "min_withdrawal": float(c.get("minWd", 0) or 0),
+            "fee": float(c.get("fee") or c.get("minFee") or 0),
+        }
+
+    def withdraw_usdc_polygon(self, amount_usd: float, to_address: str) -> str:
+        """
+        Withdraw USDC on Polygon to `to_address` (must already be in the OKX
+        withdrawal address book). Returns OKX's withdrawal id.
         """
         if settings.trading_mode != "live":
-            raise RuntimeError("withdraw_to_polygon called while not in live mode")
-        try:
-            client = self._get_client()
-            result = client["account"].withdraw(
-                ccy="USDC",
-                amt=str(amount_usd),
-                dest="4",  # 4 = on-chain address
-                toAddr=to_address,
-                chain="Polygon",
-            )
-            if result.code == "0" and result.data:
-                withdrawal_id = result.data[0].get("wdId", "")
-                logger.info("OKX withdrawal submitted: %s", withdrawal_id)
-                return withdrawal_id
-            raise RuntimeError(f"OKX withdrawal failed: {result.msg}")
-        except Exception as e:
-            logger.error("OKX withdrawal failed: %s", e)
-            raise
+            raise RuntimeError("withdraw_usdc_polygon called while not in live mode")
+        chain = self.get_polygon_usdc_chain()
+        if not chain["can_withdraw"]:
+            raise RuntimeError(f"OKX withdrawals on {chain['chain']} are currently suspended")
+        if amount_usd < chain["min_withdrawal"]:
+            raise RuntimeError(f"amount below OKX minimum {chain['min_withdrawal']}")
+        body = {
+            "ccy": "USDC",
+            "amt": f"{amount_usd:.2f}",
+            "dest": "4",  # 4 = on-chain withdrawal
+            "toAddr": to_address,
+            "chain": chain["chain"],
+        }
+        data = self._signed("POST", "/api/v5/asset/withdrawal", body)["data"]
+        wd_id = data[0].get("wdId", "")
+        logger.info("OKX withdrawal submitted: %s ($%.2f → %s)", wd_id, amount_usd, to_address)
+        return wd_id
+
+    # Backwards-compatible name
+    def withdraw_to_polygon(self, amount_usd: float, to_address: str) -> str:
+        return self.withdraw_usdc_polygon(amount_usd, to_address)
 
     def get_withdrawal_status(self, withdrawal_id: str) -> Optional[Dict]:
-        """Check the status of a pending withdrawal."""
-        try:
-            client = self._get_client()
-            result = client["account"].get_deposit_withdraw_history(
-                wdId=withdrawal_id
-            )
-            if result.data:
-                return result.data[0]
-            return None
-        except Exception as e:
-            logger.error("OKX withdrawal status query failed: %s", e)
-            return None
+        """Status of a withdrawal (state: -3..2; 2 = success)."""
+        data = self._signed("GET", f"/api/v5/asset/withdrawal-history?wdId={withdrawal_id}")["data"]
+        return data[0] if data else None
+
+
+class OKXAPIError(RuntimeError):
+    def __init__(self, code: str, msg: str):
+        super().__init__(f"OKX API error {code}: {msg}")
+        self.code = code

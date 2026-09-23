@@ -15,6 +15,7 @@ Constituent exchanges (per CF Benchmarks):
   - Bitstamp (btcusd)
   - Gemini (btcusd)
 """
+import heapq
 import json
 import logging
 import time
@@ -27,6 +28,18 @@ from connectors.exchange_ws_base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Only the top of each venue's book matters for the index. Full-depth local
+# books reach ~40k levels on Coinbase; re-sorting them on every message and
+# merging them on every tick starved the whole process of CPU.
+MAX_LEVELS_PER_SIDE = 100
+
+
+def _top_levels(book: Dict[float, float], bids: bool) -> List["OrderbookLevel"]:
+    """Best MAX_LEVELS_PER_SIDE levels of a {price: size} book, best first."""
+    pick = heapq.nlargest if bids else heapq.nsmallest
+    return [OrderbookLevel(price=p, size=book[p]) for p in pick(MAX_LEVELS_PER_SIDE, book)]
+
 
 
 class CoinbaseWSS(ExchangeWebSocketBase):
@@ -79,8 +92,8 @@ class CoinbaseWSS(ExchangeWebSocketBase):
 
         return OrderbookSnapshot(
             exchange=self.exchange_name,
-            bids=bids,
-            asks=asks,
+            bids=bids[:MAX_LEVELS_PER_SIDE],
+            asks=asks[:MAX_LEVELS_PER_SIDE],
             timestamp=time.time(),
         )
 
@@ -100,15 +113,8 @@ class CoinbaseWSS(ExchangeWebSocketBase):
             else:
                 book[price] = size
 
-        bids = sorted(
-            [OrderbookLevel(price=p, size=s) for p, s in self._local_book["bids"].items()],
-            key=lambda x: x.price,
-            reverse=True,
-        )
-        asks = sorted(
-            [OrderbookLevel(price=p, size=s) for p, s in self._local_book["asks"].items()],
-            key=lambda x: x.price,
-        )
+        bids = _top_levels(self._local_book["bids"], bids=True)
+        asks = _top_levels(self._local_book["asks"], bids=False)
 
         return OrderbookSnapshot(
             exchange=self.exchange_name,
@@ -162,7 +168,10 @@ class KrakenWSS(ExchangeWebSocketBase):
             return None
 
         msg_type = data.get("type")
-        book_data = data.get("data", {})
+        # v2 sends "data": [ {symbol, bids, asks, checksum, timestamp} ]
+        book_data = data.get("data") or {}
+        if isinstance(book_data, list):
+            book_data = book_data[0] if book_data else {}
 
         if msg_type == "snapshot":
             return self._parse_snapshot(book_data)
@@ -212,14 +221,8 @@ class KrakenWSS(ExchangeWebSocketBase):
         return self._build_snapshot(data.get("timestamp", time.time()))
 
     def _build_snapshot(self, timestamp) -> OrderbookSnapshot:
-        bids = sorted(
-            [OrderbookLevel(price=p, size=s) for p, s in self._local_book["bids"].items()],
-            key=lambda x: x.price, reverse=True,
-        )
-        asks = sorted(
-            [OrderbookLevel(price=p, size=s) for p, s in self._local_book["asks"].items()],
-            key=lambda x: x.price,
-        )
+        bids = _top_levels(self._local_book["bids"], bids=True)
+        asks = _top_levels(self._local_book["asks"], bids=False)
 
         if isinstance(timestamp, str):
             try:
@@ -250,7 +253,7 @@ class BitstampWSS(ExchangeWebSocketBase):
         return "wss://ws.bitstamp.net"
 
     def _build_subscribe_message(self) -> str:
-        channel = f"order_book_{self.symbol.lower()}"
+        channel = f"order_book_{self.symbol.lower().replace('-', '').replace('/', '')}"
         return json.dumps({
             "event": "bts:subscribe",
             "data": {"channel": channel},
@@ -258,18 +261,11 @@ class BitstampWSS(ExchangeWebSocketBase):
 
     def _parse_message(self, raw: str) -> Optional[OrderbookSnapshot]:
         data = json.loads(raw)
-        event = data.get("event", "")
-
-        if "order_book" not in event:
-            return None
-        if event.endswith("data"):
-            pass
-        elif "data" in data:
-            pass
-        else:
+        # Book updates arrive as {"event": "data", "channel": "order_book_btcusd", "data": {...}}
+        if data.get("event") != "data" or not str(data.get("channel", "")).startswith("order_book"):
             return None
 
-        book_data = data.get("data", data)
+        book_data = data.get("data") or {}
         if "bids" not in book_data:
             return None
 
@@ -286,6 +282,7 @@ class BitstampWSS(ExchangeWebSocketBase):
 
         bids.sort(key=lambda x: x.price, reverse=True)
         asks.sort(key=lambda x: x.price)
+        bids, asks = bids[:MAX_LEVELS_PER_SIDE], asks[:MAX_LEVELS_PER_SIDE]
 
         ts = book_data.get("timestamp")
         if ts is None:
@@ -305,7 +302,7 @@ class GeminiWSS(ExchangeWebSocketBase):
     """
     Gemini WebSocket v2.
     Channel: l2 — level 2 orderbook updates.
-    URL: wss://api.gemini.com/v2/marketdata/{symbol}
+    URL: wss://api.gemini.com/v2/marketdata (subscribe to l2 for e.g. BTCUSD)
 
     Gemini sends full book as first message, then incremental updates.
     """
@@ -318,84 +315,37 @@ class GeminiWSS(ExchangeWebSocketBase):
         self._book_initialized = False
 
     def _get_url(self) -> str:
-        symbol = self.symbol.lower().replace("-", "")
-        return f"wss://api.gemini.com/v2/marketdata/{symbol}"
+        return "wss://api.gemini.com/v2/marketdata"
 
     def _build_subscribe_message(self) -> str:
-        # Gemini v2 auto-subscribes on connection, no explicit subscribe needed
-        return ""
+        symbol = self.symbol.upper().replace("-", "").replace("/", "")
+        return json.dumps({"type": "subscribe", "subscriptions": [{"name": "l2", "symbols": [symbol]}]})
 
     def _parse_message(self, raw: str) -> Optional[OrderbookSnapshot]:
+        """
+        v2 l2 feed: the first "l2_updates" message carries the full book, later
+        ones carry incremental changes; each change is [side, price, qty] with
+        side "buy"/"sell" and qty 0 meaning the level was removed.
+        """
         data = json.loads(raw)
-
-        if "heartbeat" in data:
+        if data.get("type") != "l2_updates":
             return None
-
-        events = data.get("events", [])
-        if not events:
-            return None
-
-        snapshot_event = None
-        change_events = []
-
-        for event in events:
-            typ = event.get("type")
-            if typ == "snapshot":
-                snapshot_event = event
-            elif typ == "change":
-                change_events.append(event)
-
-        if snapshot_event:
-            return self._handle_snapshot(snapshot_event)
-        elif change_events:
-            return self._handle_changes(change_events, data.get("timestamp", time.time()))
-
-        return None
-
-    def _handle_snapshot(self, event: Dict) -> OrderbookSnapshot:
-        self._local_book = {"bids": {}, "asks": {}}
-
-        for item in event.get("bids", []):
-            price = float(item["price"])
-            qty = float(item["remaining"])
-            if qty > 0:
-                self._local_book["bids"][price] = qty
-
-        for item in event.get("asks", []):
-            price = float(item["price"])
-            qty = float(item["remaining"])
-            if qty > 0:
-                self._local_book["asks"][price] = qty
-
-        self._book_initialized = True
-        return self._build_snapshot(time.time())
-
-    def _handle_changes(self, changes: List[Dict], timestamp) -> Optional[OrderbookSnapshot]:
+        changes = data.get("changes") or []
         if not self._book_initialized:
-            return None
-
-        for change in changes:
-            side = change.get("side")
-            price = float(change["price"])
-            qty = float(change["remaining"])
-
-            book = self._local_book["bids"] if side == "bid" else self._local_book["asks"]
+            self._local_book = {"bids": {}, "asks": {}}
+            self._book_initialized = True
+        for side, price, qty in changes:
+            book = self._local_book["bids"] if side == "buy" else self._local_book["asks"]
+            price, qty = float(price), float(qty)
             if qty == 0:
                 book.pop(price, None)
             else:
                 book[price] = qty
-
-        return self._build_snapshot(timestamp)
+        return self._build_snapshot(time.time())
 
     def _build_snapshot(self, timestamp) -> OrderbookSnapshot:
-        bids = sorted(
-            [OrderbookLevel(price=p, size=s) for p, s in self._local_book["bids"].items()],
-            key=lambda x: x.price, reverse=True,
-        )
-        asks = sorted(
-            [OrderbookLevel(price=p, size=s) for p, s in self._local_book["asks"].items()],
-            key=lambda x: x.price,
-        )
+        bids = _top_levels(self._local_book["bids"], bids=True)
+        asks = _top_levels(self._local_book["asks"], bids=False)
         return OrderbookSnapshot(
             exchange=self.exchange_name,
             bids=bids,
@@ -439,11 +389,11 @@ def get_all_exchange_ws(
     ws_instances = []
     for exchange in exchanges:
         try:
-            # Kraken uses different symbol format
-            kraken_symbol = "XBT/USD" if exchange == "kraken" else symbol
+            # Kraken's v2 API uses "BTC/USD" (the old "XBT/USD" is rejected)
+            exchange_symbol = symbol.replace("-", "/") if exchange == "kraken" else symbol
             ws = create_exchange_ws(
                 exchange=exchange,
-                symbol=kraken_symbol,
+                symbol=exchange_symbol,
                 on_snapshot=on_snapshot,
             )
             ws_instances.append(ws)

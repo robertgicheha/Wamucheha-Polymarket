@@ -285,30 +285,11 @@ class PMXTWrapper:
         )
 
     async def _place_pm_order(self, order: UnifiedOrder) -> Optional[UnifiedFill]:
-        """Place order on Polymarket."""
-        try:
-            if self._pmxt_client:
-                return await self._pmxt_place_pm_order(order)
-            elif self._pm_connector:
-                result = self._pm_connector.place_order(
-                    token_id=order.market_id,
-                    side="BUY" if order.side == "YES" else "SELL",
-                    price=order.price,
-                    size=order.size_usd / order.price if order.price > 0 else 0,
-                )
-                return UnifiedFill(
-                    platform="polymarket",
-                    market_id=order.market_id,
-                    side=order.side,
-                    requested_price=order.price,
-                    filled_price=result.get("filled_price", order.price),
-                    size_usd=order.size_usd,
-                    fee_usd=0.0,
-                    order_id=result.get("order_id", ""),
-                    timestamp=time.time(),
-                )
-        except Exception as e:
-            logger.error("PM order failed: %s", e)
+        """
+        Live Polymarket orders go exclusively through execution.LiveExecutor
+        (guard rails, fill verification). This wrapper is market-data only.
+        """
+        logger.error("PMXT live Polymarket orders are disabled — use execution.LiveExecutor")
         return None
 
     # async def _place_kalshi_order(self, order: UnifiedOrder) -> Optional[UnifiedFill]:

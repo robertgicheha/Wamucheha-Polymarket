@@ -7,10 +7,17 @@ Endpoints:
   - Klines (OHLCV): GET https://api.binance.com/api/v3/klines
   - Funding rate history: GET https://fapi.binance.com/fapi/v1/fundingRate
   - Current funding rate: GET https://fapi.binance.com/fapi/v1/premiumIndex
+
+Funding (signed, needs BINANCE_API_KEY/SECRET): USDC withdrawals on Polygon
+to FUNDING_DEPOSIT_ADDRESS. The key needs "Enable Withdrawals", which Binance
+only allows on IP-restricted keys, and the address must be whitelisted.
 """
+import hashlib
+import hmac
 import logging
 import time
 from typing import Dict, List, Optional
+from urllib.parse import urlencode
 
 import requests
 
@@ -213,3 +220,91 @@ class BinanceConnector:
         except requests.RequestException as e:
             logger.error("Binance long/short ratio request failed: %s", e)
             return []
+
+    # ── Funding (signed) ───────────────────────────────────────────────
+
+    def _signed(self, method: str, path: str, **params) -> Dict | List:
+        if not (self.api_key and self.api_secret):
+            raise RuntimeError("Binance API credentials are not configured")
+        params["timestamp"] = int(time.time() * 1000)
+        params["recvWindow"] = 10000
+        query = urlencode(params)
+        signature = hmac.new(self.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+        resp = self._session.request(
+            method, f"{BINANCE_SPOT_BASE}{path}?{query}&signature={signature}", timeout=15
+        )
+        data = resp.json()
+        if resp.status_code != 200:
+            raise BinanceAPIError(
+                data.get("code", resp.status_code) if isinstance(data, dict) else resp.status_code,
+                data.get("msg", resp.text[:200]) if isinstance(data, dict) else resp.text[:200],
+            )
+        return data
+
+    def get_api_permissions(self) -> Dict:
+        r = self._signed("GET", "/sapi/v1/account/apiRestrictions")
+        return {
+            "ip_restricted": bool(r.get("ipRestrict")),
+            "can_read": bool(r.get("enableReading")),
+            "can_withdraw": bool(r.get("enableWithdrawals")),
+            "can_trade_spot": bool(r.get("enableSpotAndMarginTrading")),
+        }
+
+    def _usdc_coin_config(self) -> Dict:
+        for coin in self._signed("GET", "/sapi/v1/capital/config/getall"):
+            if coin.get("coin") == "USDC":
+                return coin
+        raise RuntimeError("Binance returned no USDC config")
+
+    def get_usdc_balance(self) -> float:
+        """Free USDC in the Binance spot wallet."""
+        return float(self._usdc_coin_config().get("free", 0) or 0)
+
+    def get_polygon_usdc_network(self) -> Dict:
+        """
+        Binance's network code for USDC on Polygon PoS ("MATIC" today),
+        discovered at runtime rather than hard-coded.
+        """
+        for n in self._usdc_coin_config().get("networkList", []):
+            label = f"{n.get('network', '')} {n.get('name', '')}".lower()
+            if "polygon" in label:
+                return {
+                    "network": n["network"],
+                    "can_withdraw": bool(n.get("withdrawEnable")),
+                    "min_withdrawal": float(n.get("withdrawMin", 0) or 0),
+                    "fee": float(n.get("withdrawFee", 0) or 0),
+                }
+        raise RuntimeError("Binance offers no Polygon network for USDC")
+
+    def withdraw_usdc_polygon(self, amount_usd: float, to_address: str) -> str:
+        """Withdraw USDC on Polygon to a whitelisted address. Returns Binance's id."""
+        from config.settings import settings
+
+        if settings.trading_mode != "live":
+            raise RuntimeError("withdraw_usdc_polygon called while not in live mode")
+        net = self.get_polygon_usdc_network()
+        if not net["can_withdraw"]:
+            raise RuntimeError("Binance USDC withdrawals on Polygon are currently suspended")
+        if amount_usd < net["min_withdrawal"]:
+            raise RuntimeError(f"amount below Binance minimum {net['min_withdrawal']}")
+        r = self._signed(
+            "POST", "/sapi/v1/capital/withdraw/apply",
+            coin="USDC", network=net["network"], address=to_address,
+            amount=f"{amount_usd:.2f}", walletType=0,
+        )
+        wd_id = r.get("id", "")
+        logger.info("Binance withdrawal submitted: %s ($%.2f → %s)", wd_id, amount_usd, to_address)
+        return wd_id
+
+    def get_withdrawal_status(self, withdrawal_id: str) -> Optional[Dict]:
+        """Status of a withdrawal (status 6 = completed)."""
+        for w in self._signed("GET", "/sapi/v1/capital/withdraw/history", coin="USDC", limit=50):
+            if w.get("id") == withdrawal_id:
+                return w
+        return None
+
+
+class BinanceAPIError(RuntimeError):
+    def __init__(self, code, msg: str):
+        super().__init__(f"Binance API error {code}: {msg}")
+        self.code = code

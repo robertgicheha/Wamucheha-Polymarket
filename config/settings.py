@@ -7,9 +7,17 @@ import os
 from dataclasses import dataclass, field
 from typing import List
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+_ENV_FILE = os.path.join(os.path.dirname(__file__), ".env")
+load_dotenv(_ENV_FILE)
+
+# `KEY=    # comment` (blank value + inline comment) is read by python-dotenv
+# as the comment text itself; treat such values as empty so e.g. an unset
+# address never becomes the string "# where to send...".
+for _key, _val in dotenv_values(_ENV_FILE).items():
+    if _val is not None and _val.strip().startswith("#") and os.environ.get(_key) == _val:
+        os.environ[_key] = ""
 
 
 def _bool(key: str, default: bool) -> bool:
@@ -36,6 +44,14 @@ def _list_float(key: str, default: List[float]) -> List[float]:
     return [float(x.strip()) for x in val.split(",") if x.strip()]
 
 
+LIVE_TRADING_ACK_PHRASE = "I understand this trades real money"
+
+
+def _looks_like_address(value: str) -> bool:
+    v = value.strip()
+    return len(v) == 42 and v.startswith("0x") and all(c in "0123456789abcdefABCDEF" for c in v[2:])
+
+
 def _list_str(key: str, default: List[str]) -> List[str]:
     val = os.getenv(key)
     if val is None or val.strip() == "":
@@ -56,6 +72,16 @@ class Settings:
     polymarket_api_passphrase: str = os.getenv("POLYMARKET_API_PASSPHRASE", "")
     polymarket_host: str = os.getenv("POLYMARKET_HOST", "https://clob.polymarket.com")
     gamma_api_host: str = os.getenv("GAMMA_API_HOST", "https://gamma-api.polymarket.com")
+    # The Polymarket account wallet that HOLDS the pUSD and positions (the
+    # "funder" in CLOB terms). For accounts made on polymarket.com this is the
+    # address shown in the profile menu (Deposit / Proxy / Safe wallet), NOT
+    # your signer EOA and NOT an OKX/Binance deposit address. Leave empty to
+    # use the signer key's own Deposit Wallet.
+    polymarket_funder_address: str = os.getenv("POLYMARKET_FUNDER_ADDRESS", "")
+    # Relayer API key (polymarket.com → Settings → API Keys → Relayer API Keys)
+    # enables gasless approvals and redemptions for Deposit/Proxy/Safe wallets.
+    polymarket_relayer_api_key: str = os.getenv("POLYMARKET_RELAYER_API_KEY", "")
+    polymarket_relayer_api_key_address: str = os.getenv("POLYMARKET_RELAYER_API_KEY_ADDRESS", "")
 
     # # Kalshi (commented out)
     # kalshi_api_key: str = os.getenv("KALSHI_API_KEY", "")
@@ -75,7 +101,12 @@ class Settings:
 
     # Polygon
     polygon_rpc_url: str = os.getenv("POLYGON_RPC_URL", "")
+    # Comma-separated backup RPCs, tried in order when the primary fails.
+    polygon_rpc_fallback_urls: List[str] = field(
+        default_factory=lambda: _list_str("POLYGON_RPC_FALLBACK_URLS", ["https://polygon.drpc.org"])
+    )
     polygon_wallet_address: str = os.getenv("POLYGON_WALLET_ADDRESS", "")
+    polygon_rpc_timeout_seconds: float = _float("POLYGON_RPC_TIMEOUT_SECONDS", 10.0)
 
     # The Graph subgraph
     graph_subgraph_url: str = os.getenv("GRAPH_SUBGRAPH_URL", "")
@@ -90,6 +121,19 @@ class Settings:
     okx_api_key: str = os.getenv("OKX_API_KEY", "")
     okx_api_secret: str = os.getenv("OKX_API_SECRET", "")
     okx_api_passphrase: str = os.getenv("OKX_API_PASSPHRASE", "")
+
+    # Funding (OKX / Binance → Polymarket). The exchanges are funding SOURCES:
+    # the bot withdraws USDC on Polygon from them to FUNDING_DEPOSIT_ADDRESS,
+    # which must be your Polymarket deposit address (polymarket.com → Deposit,
+    # Polygon USDC) and must be whitelisted on the exchange. Withdrawals are
+    # only ever sent to that single address.
+    funding_deposit_address: str = os.getenv("FUNDING_DEPOSIT_ADDRESS", "")
+    auto_funding_enabled: bool = _bool("AUTO_FUNDING_ENABLED", False)
+    funding_source: str = os.getenv("FUNDING_SOURCE", "okx")  # okx | binance
+    funding_min_balance_usd: float = _float("FUNDING_MIN_BALANCE_USD", 20.0)
+    funding_topup_usd: float = _float("FUNDING_TOPUP_USD", 50.0)
+    funding_max_withdrawal_usd: float = _float("FUNDING_MAX_WITHDRAWAL_USD", 100.0)
+    funding_max_daily_usd: float = _float("FUNDING_MAX_DAILY_USD", 200.0)
 
     # News / data
     newsapi_key: str = os.getenv("NEWSAPI_KEY", "")
@@ -153,6 +197,9 @@ class Settings:
     ml_kelly_fraction: float = _float("ML_KELLY_FRACTION", 0.25)
     ml_confidence_threshold: float = _float("ML_CONFIDENCE_THRESHOLD", 0.3)
     ml_prediction_enabled: bool = _bool("ML_PREDICTION_ENABLED", False)
+    # Allow live trading on the volatility fair-value model alone (no ML).
+    # Only enable after paper results show a positive net edge.
+    allow_baseline_live: bool = _bool("ALLOW_BASELINE_LIVE", False)
 
     # BRTI Engine
     brti_exchanges: List[str] = field(
@@ -164,7 +211,7 @@ class Settings:
     brti_max_volume: float = _float("BRTI_MAX_VOLUME", 5000.0)
     brti_deviation_threshold: float = _float("BRTI_DEVIATION_THRESHOLD", 0.005)
     brti_validation_enabled: bool = _bool("BRTI_VALIDATION_ENABLED", True)
-    brti_max_divergence_bps: float = _float("BRTI_MAX_DIVERGENCE_BPS", 0.5)
+    brti_max_divergence_bps: float = _float("BRTI_MAX_DIVERGENCE_BPS", 5.0)
     brti_tick_interval_seconds: int = _int("BRTI_TICK_INTERVAL_SECONDS", 1)
     # brti_kalshi_avg_window: int = _int("BRTI_KALSHI_AVG_WINDOW", 60)
 
@@ -208,6 +255,32 @@ class Settings:
     early_exit_take_profit_pct: float = _float("EARLY_EXIT_TAKE_PROFIT_PCT", 5.0)
     early_exit_stop_loss_pct: float = _float("EARLY_EXIT_STOP_LOSS_PCT", 8.0)
     orderbook_update_interval: float = _float("ORDERBOOK_UPDATE_INTERVAL", 1.0)
+    # Which up/down markets to trade: assets and window length in minutes.
+    updown_assets: List[str] = field(
+        default_factory=lambda: _list_str("UPDOWN_ASSETS", ["btc"])
+    )
+    updown_interval_minutes: int = _int("UPDOWN_INTERVAL_MINUTES", 5)
+
+    # Execution & live-trading guard rails
+    # Net edge (model prob − all-in cost incl. taker fee) required to enter.
+    min_net_edge: float = _float("MIN_NET_EDGE", 0.03)
+    # Sell early only if the bid (after fees) beats model value by this much.
+    exit_edge: float = _float("EXIT_EDGE", 0.02)
+    max_spread: float = _float("MAX_SPREAD", 0.04)
+    # No entries in the first/last N seconds of a window.
+    entry_min_elapsed_seconds: int = _int("ENTRY_MIN_ELAPSED_SECONDS", 20)
+    entry_min_remaining_seconds: int = _int("ENTRY_MIN_REMAINING_SECONDS", 20)
+    # Reference-price (Chainlink vs our exchange index) basis risk, in bps,
+    # added to the volatility used by the fair-value model.
+    settlement_basis_bps: float = _float("SETTLEMENT_BASIS_BPS", 2.0)
+    live_max_order_usd: float = _float("LIVE_MAX_ORDER_USD", 10.0)
+    live_max_open_exposure_usd: float = _float("LIVE_MAX_OPEN_EXPOSURE_USD", 30.0)
+    # Must be set to exactly this phrase to allow live orders.
+    live_trading_ack: str = os.getenv("LIVE_TRADING_ACK", "")
+    kill_switch_file: str = os.getenv("KILL_SWITCH_FILE", "KILL_SWITCH")
+    auto_redeem_enabled: bool = _bool("AUTO_REDEEM_ENABLED", True)
+    # Cross-platform arb is simulation-only; it never places real orders.
+    arb_scan_enabled: bool = _bool("ARB_SCAN_ENABLED", False)
 
     # Scheduler (5-min pings + hourly reports)
     status_ping_interval_seconds: int = _int("STATUS_PING_INTERVAL_SECONDS", 300)
@@ -220,25 +293,31 @@ class Settings:
 
     def validate_for_live_trading(self) -> None:
         """Call this before allowing TRADING_MODE=live. Fails loud, not silent."""
-        missing = []
-        required = [
-            "polymarket_private_key",
-            "polymarket_api_key",
-            "polygon_rpc_url",
-            "polygon_wallet_address",
-        ]
-        for field_name in required:
+        problems = []
+        for field_name in ("polymarket_private_key", "polygon_rpc_url"):
             if not getattr(self, field_name):
-                missing.append(field_name.upper())
-        if missing:
-            raise RuntimeError(
-                f"Cannot start live trading, missing required config: {missing}"
+                problems.append(f"missing {field_name.upper()}")
+        if self.live_trading_ack != LIVE_TRADING_ACK_PHRASE:
+            problems.append(
+                f'LIVE_TRADING_ACK must be set to "{LIVE_TRADING_ACK_PHRASE}"'
             )
-        if self.trading_mode == "live":
-            print(
-                "!! TRADING_MODE=live -- this bot will place real orders with real "
-                "capital. Confirm you have run paper mode for at least 2-4 weeks "
-                "and reviewed backtest results before proceeding."
+        if not self.ml_prediction_enabled and not self.allow_baseline_live:
+            problems.append(
+                "neither ML_PREDICTION_ENABLED nor ALLOW_BASELINE_LIVE is set — "
+                "refusing to trade live without a validated model"
+            )
+        if self.live_max_order_usd <= 0 or self.live_max_open_exposure_usd <= 0:
+            problems.append("LIVE_MAX_ORDER_USD and LIVE_MAX_OPEN_EXPOSURE_USD must be > 0")
+        for addr_field in ("polymarket_funder_address", "funding_deposit_address",
+                           "withdrawal_destination_address"):
+            value = getattr(self, addr_field)
+            if value and not _looks_like_address(value):
+                problems.append(f"{addr_field.upper()} is not a valid 0x address")
+        if self.auto_funding_enabled and not self.funding_deposit_address:
+            problems.append("AUTO_FUNDING_ENABLED requires FUNDING_DEPOSIT_ADDRESS")
+        if problems:
+            raise RuntimeError(
+                "Cannot start live trading:\n  - " + "\n  - ".join(problems)
             )
 
 

@@ -3,14 +3,16 @@ python-dotenv>=1.0.0
 requests>=2.31.0
 
 # Blockchain / Polymarket
-web3>=6.0.0
-py-clob-client>=0.10.0
+# polymarket-client is Polymarket's official SDK for CLOB V2 + pUSD (the
+# legacy py-clob-client stopped working at the 2026-04-28 exchange upgrade).
+# Requires Python >= 3.11.
+polymarket-client>=0.11.0,<0.12
+web3>=7.0.0
 eth-abi>=4.2.0
 eth-account>=0.9.0
 eth-utils>=2.3.0
 
-# Exchange connectors
-python-okx>=0.4.0
+# Exchange connectors: OKX/Binance use signed REST directly (no SDK)
 
 # Data & ML
 pandas>=2.0.0

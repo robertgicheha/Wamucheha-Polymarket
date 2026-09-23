@@ -71,11 +71,7 @@ class BaseStrategy(ABC):
 
     def _determine_side(self, model_prob: float, market_price: float) -> str:
         """YES if model thinks market is underpriced, NO if overpriced."""
-        if model_prob > market_price:
-            return "YES"
-        elif model_prob < (1 - market_price):
-            return "NO"
-        return "YES"
+        return "YES" if model_prob >= market_price else "NO"
 
     def _validate_price(self, market_price: float) -> bool:
         """Reject trades outside the empirical calibration zone."""

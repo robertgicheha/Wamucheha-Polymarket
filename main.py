@@ -111,11 +111,25 @@ def _init_websocket_connector():
 
 def _init_lifecycle_engine(
     arb_engine, orderbook_arb, risk_manager, trade_logger=None,
-    tte_orchestrator=None, brti_engine=None,
+    tte_orchestrator=None, brti_engine=None, pm_connector=None,
 ):
-    """Initialize 5-minute market lifecycle engine."""
+    """
+    Initialize the up/down lifecycle engine with a live market feed and the
+    executor for the current mode (real orders only when TRADING_MODE=live).
+    """
+    from connectors.updown_feed import UpDownMarketFeed
+    from execution.executor import LiveExecutor, PaperExecutor
     from strategies.lifecycle_engine import FiveMinuteLifecycleEngine
-    return FiveMinuteLifecycleEngine(
+
+    feed = UpDownMarketFeed(
+        connector=pm_connector,
+        assets=settings.updown_assets,
+        interval_minutes=settings.updown_interval_minutes,
+        discovery_interval_seconds=settings.market_discovery_interval,
+    )
+    live = settings.trading_mode == "live"
+    executor = LiveExecutor(pm_connector) if live else PaperExecutor()
+    engine = FiveMinuteLifecycleEngine(
         bankroll=risk_manager.bankroll,
         arbitrage_engine=arb_engine,
         orderbook_arb=orderbook_arb,
@@ -123,7 +137,38 @@ def _init_lifecycle_engine(
         trade_logger=trade_logger,
         tte_orchestrator=tte_orchestrator,
         brti_engine=brti_engine,
+        market_feed=feed,
+        executor=executor,
+        on_notification=lambda msg: notifier.send(msg, Severity.INFO),
     )
+    if live:
+        executor.exposure_fn = engine.open_exposure
+    return engine
+
+
+def _live_startup(pm_connector):
+    """
+    Refuse to trade live unless every critical preflight check passes, then
+    start from a clean slate: no stale resting orders, resolved winnings
+    redeemed. Returns the initial pUSD balance.
+    """
+    from execution.preflight import critical_failures, format_report, run_preflight
+
+    settings.validate_for_live_trading()
+    checks = run_preflight(include_exchanges=settings.auto_funding_enabled)
+    report = format_report(checks)
+    logger.info("Preflight:\n%s", report)
+    failures = critical_failures(checks)
+    if failures:
+        notifier.send(f"Live start ABORTED — preflight failed:\n{report}", Severity.CRITICAL)
+        raise SystemExit(f"Preflight failed ({len(failures)} critical) — not trading. See log.")
+
+    pm_connector.cancel_all()
+    from execution.executor import LiveExecutor
+    redeemed = LiveExecutor(pm_connector).redeem_all()
+    balance = pm_connector.get_collateral_balance()
+    logger.info("Live start: cancelled open orders, redeemed %d market(s), pUSD=$%.2f", redeemed, balance)
+    return balance
 
 
 # def _init_gnosis_relayer():
@@ -258,15 +303,18 @@ def main():
     logger.info("Compounding: %s", "enabled" if settings.compound_enabled else "disabled")
     logger.info("=" * 60)
 
+    from connectors.polymarket_connector import PolymarketConnector
+    pm_connector = PolymarketConnector()
+    starting_bankroll = settings.initial_stake_usd
     if settings.trading_mode == "live":
-        settings.validate_for_live_trading()
+        starting_bankroll = _live_startup(pm_connector)
 
     # ── Initialize all modules ────────────────────────────────────────
     from risk.risk_manager import CircuitBreakerTripped, RiskManager
     from data.trade_logger import TradeLogger
     from data.scheduler import BotScheduler
 
-    risk_manager = RiskManager(bankroll_usd=settings.initial_stake_usd)
+    risk_manager = RiskManager(bankroll_usd=starting_bankroll)
     trade_logger = TradeLogger()
 
     brti_engine, brti_ws = _init_brti_engine()
@@ -283,10 +331,13 @@ def main():
         lifecycle_engine = _init_lifecycle_engine(
             arb_engine, orderbook_arb, risk_manager, trade_logger,
             tte_orchestrator=tte_orchestrator, brti_engine=brti_engine,
+            pm_connector=pm_connector,
         )
         logger.info(
-            "Lifecycle engine initialized for 5-minute markets (ML prediction: %s)",
-            "enabled" if settings.ml_prediction_enabled else "disabled (fallback heuristic)",
+            "Lifecycle engine: %s | assets=%s %dm | ML tilt: %s | executor: %s",
+            "enabled", settings.updown_assets, settings.updown_interval_minutes,
+            "enabled" if settings.ml_prediction_enabled else "off (volatility fair value only)",
+            "LIVE" if settings.trading_mode == "live" else "paper",
         )
 
     # ── Initialize WebSocket connector ────────────────────────────────
@@ -413,6 +464,16 @@ def main():
     #     startup_msg += "\nGnosis Safe relayer: ENABLED"
     notifier.send(startup_msg, Severity.INFO)
 
+    funding_manager = None
+    if settings.trading_mode == "live" and settings.auto_funding_enabled:
+        from connectors.binance_connector import BinanceConnector
+        from connectors.okx_connector import OKXConnector
+        from execution.funding import FundingManager
+        funding_manager = FundingManager(
+            okx=OKXConnector() if settings.okx_api_key else None,
+            binance=BinanceConnector() if settings.binance_api_key else None,
+        )
+
     # ── Main loop ─────────────────────────────────────────────────────
     cycle_count = 0
     last_report_cycle = 0
@@ -442,8 +503,8 @@ def main():
             # rather than the placeholder random-noise features this dead
             # Kalshi-settlement-only block used to feed the model.
 
-            # ── 6. Cross-platform arbitrage scan ──────────────────────
-            pm_markets = _run_async(pmxt.get_crypto_markets())
+            # ── 6. Cross-platform arbitrage scan (simulation only) ────
+            pm_markets = _run_async(pmxt.get_crypto_markets()) if settings.arb_scan_enabled else []
             for market in pm_markets:
                 if market.platform == "polymarket":
                     arb_engine.update_pm_prices(
@@ -475,7 +536,7 @@ def main():
                         question=market.question,
                     )
 
-            opportunities = arb_engine.scan_for_opportunities()
+            opportunities = arb_engine.scan_for_opportunities() if settings.arb_scan_enabled else []
             for opp in opportunities:
                 if arb_engine.evaluate_opportunity(opp):
                     _run_async(arb_engine.execute_arb(opp))
@@ -485,7 +546,7 @@ def main():
                 arb_engine.close_position(pos_id)
 
             # ── 7. Orderbook-based intra-platform arb (5-min markets) ─
-            if settings.lifecycle_engine_enabled:
+            if settings.lifecycle_engine_enabled and settings.arb_scan_enabled:
                 ob_opps = orderbook_arb.scan_opportunities()
                 for opp in ob_opps:
                     size_usd = orderbook_arb.size_position(opp)
@@ -518,6 +579,18 @@ def main():
 
             # ── 10. Circuit breaker ───────────────────────────────────
             risk_manager.check_circuit_breaker()
+
+            # ── 10b. Auto-funding from OKX/Binance (opt-in, live only) ─
+            if funding_manager is not None and lifecycle_engine is not None:
+                wd_id = funding_manager.maybe_auto_fund(
+                    lifecycle_engine.executor.collateral_balance(),
+                    pm_connector.secure_client().wallet,
+                )
+                if wd_id:
+                    notifier.send(
+                        f"Auto-funding: withdrew ${settings.funding_topup_usd:.2f} USDC from "
+                        f"{settings.funding_source} (id {wd_id})", Severity.WARNING,
+                    )
 
             # ── 11. Write state files for admin API ───────────────────
             if cycle_count % 10 == 0:
@@ -576,6 +649,9 @@ def main():
         fast_loop_stop.set()
         if fast_loop_thread:
             fast_loop_thread.join(timeout=5)
+        if settings.trading_mode == "live":
+            # FAK orders never rest, but cancel anything left over regardless.
+            pm_connector.cancel_all()
         _run_on_background_loop(bg_loop, brti_engine.stop())
         for ws in brti_ws:
             ws.stop()
