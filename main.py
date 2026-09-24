@@ -186,7 +186,11 @@ def _live_startup(pm_connector):
 #     return GnosisSafeRelayer(config)
 
 
-def _fast_trading_loop(lifecycle_engine, stop_event: threading.Event) -> None:
+def _fast_trading_loop(
+    lifecycle_engine, stop_event: threading.Event,
+    risk_manager=None, brti_engine=None, arb_engine=None,
+    tte_orchestrator=None, trade_logger=None,
+) -> None:
     """
     Ticks the 5-minute lifecycle engine at settings.orderbook_update_interval
     (default 1s), independent of the main loop's slower
@@ -194,15 +198,38 @@ def _fast_trading_loop(lifecycle_engine, stop_event: threading.Event) -> None:
     market window). Without this, a 5-min market got ~1 tick for its whole
     lifetime and take-profit/stop-loss/entries never got a real chance to
     fire regardless of what fed the model.
+
+    Also refreshes the dashboard state here (if risk_manager is given) so
+    live price / active windows are actually real-time in the UI, instead of
+    only updating once per slow-loop cycle (up to signal_check_interval_
+    seconds, i.e. up to 5 minutes stale).
     """
     interval = settings.orderbook_update_interval
     logger.info("Fast trading loop started (interval=%.1fs)", interval)
+    tick_num = 0
     while not stop_event.is_set():
         tick_start = time.time()
+        tick_num += 1
         try:
             lifecycle_engine.tick()
         except Exception as e:
             logger.error("Fast trading loop tick failed: %s", e)
+        if risk_manager is not None:
+            try:
+                from dashboard.state import update_state
+                # trade_logger reads hit SQLite; only refresh those every 5th
+                # tick (~5s) — BRTI price / active windows still update every
+                # tick, which is what actually needs to look real-time.
+                update_state(
+                    risk_manager,
+                    brti_engine=brti_engine,
+                    arb_engine=arb_engine,
+                    tte_orchestrator=tte_orchestrator,
+                    lifecycle_engine=lifecycle_engine,
+                    trade_logger=trade_logger if tick_num % 5 == 0 else None,
+                )
+            except Exception as e:
+                logger.debug("Fast-loop dashboard state update failed: %s", e)
         elapsed = time.time() - tick_start
         stop_event.wait(max(0.0, interval - elapsed))
     logger.info("Fast trading loop stopped")
@@ -426,6 +453,11 @@ def main():
         fast_loop_thread = threading.Thread(
             target=_fast_trading_loop,
             args=(lifecycle_engine, fast_loop_stop),
+            kwargs=dict(
+                risk_manager=risk_manager, brti_engine=brti_engine,
+                arb_engine=arb_engine, tte_orchestrator=tte_orchestrator,
+                trade_logger=trade_logger,
+            ),
             daemon=True,
             name="fast-trading-loop",
         )

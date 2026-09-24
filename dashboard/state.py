@@ -165,13 +165,19 @@ def update_state(
         lc_wr = lc_stats.win_rate
         lc_trades = lc_stats.total_markets_traded
 
-    accuracy = compute_model_accuracy(trade_logger) if trade_logger else {}
-    trade_log_recent = []
+    # Callers (e.g. the fast trading loop) may pass trade_logger=None on most
+    # calls to throttle SQLite reads while still refreshing BRTI/lifecycle
+    # fields every tick — keep the last-known trade log/accuracy in that case
+    # instead of blanking them out until the next throttled call.
     if trade_logger:
+        accuracy = compute_model_accuracy(trade_logger)
         try:
             trade_log_recent = trade_logger.get_recent_trades(limit=25)
         except Exception:
-            trade_log_recent = []
+            trade_log_recent = _state.trade_log_recent
+    else:
+        accuracy = _state.model_accuracy
+        trade_log_recent = _state.trade_log_recent
 
     _state = DashboardState(
         bankroll=risk_manager.bankroll,
