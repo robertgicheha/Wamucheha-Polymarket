@@ -237,7 +237,11 @@ class Settings:
     alert_email_password: str = os.getenv("ALERT_EMAIL_PASSWORD", "")
 
     dashboard_port: int = _int("DASHBOARD_PORT", 8080)
-    dashboard_host: str = os.getenv("DASHBOARD_HOST", "0.0.0.0")
+    # Loopback by default: the safe failure mode is "unreachable" rather than
+    # "listening on every interface". scripts/expose_dashboard.sh leaves this
+    # at 127.0.0.1 deliberately, so Caddy is the only way in. Override to
+    # 0.0.0.0 only for deliberate LAN access with no proxy in front.
+    dashboard_host: str = os.getenv("DASHBOARD_HOST", "127.0.0.1")
     dashboard_username: str = os.getenv("DASHBOARD_USERNAME", "")
     dashboard_password: str = os.getenv("DASHBOARD_PASSWORD", "")
 

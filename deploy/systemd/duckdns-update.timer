@@ -1,0 +1,13 @@
+[Unit]
+Description=Keep the Wamucheha DuckDNS record pointed at this host
+
+[Timer]
+# DuckDNS TTL is 60s; five minutes is frequent enough to survive a quick
+# address change without being a pointless poll.
+OnBootSec=2min
+OnUnitActiveSec=5min
+# Spread load so a fleet of these doesn't all hit DuckDNS on the minute.
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

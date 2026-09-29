@@ -43,7 +43,31 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 # ── CONFIG — adjust these to match your actual bot's paths/schema ──────────
-ADMIN_TOKEN = os.environ["ADMIN_API_TOKEN"]  # shared secret, set in .env
+def _required_env(name: str, hint: str) -> str:
+    """Read a mandatory setting, or exit with an actionable message.
+
+    This service is auth-gated and can restart the bot or move funds, so it
+    must never start without its token. A bare os.environ[...] raised a
+    KeyError traceback that gave no hint about where the value belongs, which
+    turned a one-line config fix into a restart-loop scavenger hunt.
+    """
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise SystemExit(
+            f"FATAL: required environment variable {name} is not set.\n"
+            f"  {hint}\n"
+            f"  It belongs in config/.env, which docker-compose passes to this\n"
+            f"  service through env_file. Generate one with:\n"
+            f"      python3 -c 'import secrets; print(secrets.token_urlsafe(32))'\n"
+            f"  then restart: docker compose up -d --force-recreate admin-api"
+        )
+    return value
+
+
+ADMIN_TOKEN = _required_env(
+    "ADMIN_API_TOKEN",
+    "Shared Bearer secret for the control-plane API.",
+)
 BOT_DB_PATH = os.environ.get("BOT_DB_PATH", "/opt/btc-bot/data/trades.db")
 BOT_LOG_PATH = os.environ.get("BOT_LOG_PATH", "/opt/btc-bot/logs/bot.log")
 CONTROL_FILE = os.environ.get("CONTROL_FILE_PATH", "/opt/btc-bot/data/control.json")

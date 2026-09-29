@@ -156,11 +156,15 @@ def _live_startup(pm_connector):
 
     settings.validate_for_live_trading()
     checks = run_preflight(include_exchanges=settings.auto_funding_enabled)
-    report = format_report(checks)
-    logger.info("Preflight:\n%s", report)
+    # Two renderings on purpose: the log gets ANSI colour, the Telegram copy
+    # must not — escape codes render as literal garbage in a chat bubble.
+    logger.info("Preflight:\n%s", format_report(checks, color=True))
     failures = critical_failures(checks)
     if failures:
-        notifier.send(f"Live start ABORTED — preflight failed:\n{report}", Severity.CRITICAL)
+        notifier.send(
+            f"Live start ABORTED — preflight failed:\n{format_report(checks, color=False)}",
+            Severity.CRITICAL,
+        )
         raise SystemExit(f"Preflight failed ({len(failures)} critical) — not trading. See log.")
 
     pm_connector.cancel_all()

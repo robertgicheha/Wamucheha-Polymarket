@@ -690,7 +690,39 @@ def run():
             "authentication. Fine for localhost-only access; do not expose "
             "this port publicly without setting them."
         )
-    app.run(host=settings.dashboard_host, port=settings.dashboard_port)
+
+    host = settings.dashboard_host
+    port = settings.dashboard_port
+
+    # Prefer a real WSGI server. Flask's built-in server is Werkzeug's dev
+    # server: it is single-threaded per worker, has no request limits, and is
+    # not supported for production. That is survivable on localhost, but this
+    # process sits directly behind a public reverse proxy, where a handful of
+    # concurrent browser connections (or one slow-loris) would otherwise stall
+    # every other viewer. Waitress is pure Python, so it installs cleanly on a
+    # VPS with no compiler toolchain.
+    try:
+        from waitress import serve
+    except ImportError:
+        import logging
+        logging.getLogger(__name__).warning(
+            "waitress is not installed; falling back to the Flask dev server. "
+            "Install it (pip install waitress) before serving this publicly."
+        )
+        app.run(host=host, port=port, threaded=True)
+        return
+
+    # A reverse proxy terminates TLS and is the only permitted client, so the
+    # socket itself never needs to be reachable beyond loopback. Cap the
+    # request body so an unauthenticated client cannot hold a worker open.
+    serve(
+        app,
+        host=host,
+        port=port,
+        threads=8,
+        max_request_body_size=1 * 1024 * 1024,
+        ident="wamucheha-dashboard",
+    )
 
 
 if __name__ == "__main__":

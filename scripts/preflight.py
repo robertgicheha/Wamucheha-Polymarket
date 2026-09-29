@@ -38,14 +38,11 @@ def main() -> int:
               else "STILL MISSING")
 
     checks = run_preflight(include_exchanges=not args.no_exchanges)
+    # render_report() already prints the tally, the verdict and the ordered
+    # next steps, so this script only needs to set the exit code.
     print(format_report(checks))
     failures = critical_failures(checks)
-    print()
-    if failures:
-        print(f"NOT READY: {len(failures)} critical check(s) failed.")
-        return 1
-    print("READY for live trading.")
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

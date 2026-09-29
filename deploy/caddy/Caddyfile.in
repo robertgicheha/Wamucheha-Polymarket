@@ -1,0 +1,77 @@
+# Caddyfile template for the Wamucheha Polymarket dashboard.
+#
+# Rendered by scripts/expose_dashboard.sh — the placeholder tokens below are
+# substituted there. Edit that script, not a rendered /etc/caddy/Caddyfile,
+# because a manual edit is wiped on the next run.
+#
+# Why Caddy and not nginx: Caddy obtains and renews the Let's Encrypt
+# certificate on its own. DuckDNS works with the HTTP-01 challenge (the domain
+# already resolves to this VPS), so this is the least moving parts that still
+# gives real HTTPS. Without TLS, HTTP Basic Auth would put the dashboard
+# password on the wire in cleartext on every single request.
+{
+	email __ACME_EMAIL__
+	# DuckDNS occasionally returns stale/AAAA-less answers; keep ACME patient.
+	acme_ca https://acme-v02.api.letsencrypt.org/directory
+}
+
+__DOMAIN__ {
+	encode zstd gzip
+
+	# ── Layer 1: this proxy ────────────────────────────────────────────
+	# Password is a bcrypt hash, not the plaintext. Generate with:
+	#   caddy hash-password --plaintext 'your-password'
+	# Caddy 2.8 renamed basicauth -> basic_auth; the setup script picks the
+	# right one for the installed version.
+	__AUTH_DIRECTIVE__ {
+		__DASHBOARD_USER__ __DASHBOARD_PASS_HASH__
+	}
+
+	# ── The money-moving endpoint stays off the public internet ────────
+	# POST /api/withdraw transfers real USDC out of the trading wallet. It is
+	# deliberately NOT reachable through this proxy at all, so a leaked
+	# dashboard password cannot move funds. Use the admin API over an SSH
+	# tunnel (see deploy/README.md) when you actually need to withdraw.
+	@withdraw path /api/withdraw /api/withdraw/*
+	respond @withdraw 403 {
+		body "Withdrawal is disabled on the public dashboard.\nUse the admin API over an SSH tunnel instead.\n"
+		close
+	}
+
+	# ── Response hardening ─────────────────────────────────────────────
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'"
+		-Server
+	}
+
+	# ── Upstream ───────────────────────────────────────────────────────
+	# 127.0.0.1 only: the Flask app is never bound to a public interface, so
+	# the proxy is the single way in. Flask keeps its own Basic Auth as an
+	# inner layer; Caddy forwards the same Authorization header upstream, so
+	# the browser still only prompts once.
+	#
+	# {remote_host} is the direct TCP peer, which with nothing in front of
+	# Caddy is the real client and cannot be spoofed. X-Forwarded-For is
+	# overridden rather than appended on purpose: Caddy's default appends the
+	# client IP to whatever the request already carried, so a visitor could
+	# otherwise hand the app an arbitrary value. X-Forwarded-Proto is left to
+	# Caddy, which always overwrites it with the real scheme. Caddy logs an
+	# "unnecessary header_up" warning for the line below; it is expected.
+	reverse_proxy 127.0.0.1:__DASHBOARD_PORT__ {
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+	}
+
+	# JSON access log — this is what the fail2ban jail watches for 401s.
+	log {
+		output file /var/log/caddy/wamucheha-access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+		format json
+	}
+}

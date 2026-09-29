@@ -1,0 +1,17 @@
+[Unit]
+Description=Update the DuckDNS record for the Wamucheha dashboard
+Documentation=https://www.duckdns.org/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/duckdns_update.sh
+# Nothing here needs privilege beyond reading the token file.
+User=nobody
+Group=nogroup
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/duckdns.env /etc/duckdns.domain

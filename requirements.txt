@@ -37,6 +37,9 @@ scipy>=1.10.0
 
 # Dashboard
 flask>=3.0.0
+# Production WSGI server for the dashboard. The Flask dev server is not
+# suitable behind the public reverse proxy set up by scripts/expose_dashboard.sh.
+waitress>=3.0.0
 
 # WebSocket (BRTI exchange feeds + Polymarket WS)
 websockets>=12.0
