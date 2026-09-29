@@ -68,7 +68,8 @@ CREATE TABLE IF NOT EXISTS trades (
     -- Metadata
     strategy        TEXT DEFAULT '',
     source          TEXT DEFAULT 'lifecycle',  -- lifecycle / arb / manual
-    bankroll_after  REAL DEFAULT 0.0,
+    balance_at_entry REAL DEFAULT 0.0,       -- balance once the stake left (never overwritten)
+    bankroll_after  REAL DEFAULT 0.0,        -- balance once the position settled
     metadata_json   TEXT DEFAULT '{}'
 );
 
@@ -104,10 +105,45 @@ CREATE TABLE IF NOT EXISTS daily_summary (
 CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
 CREATE INDEX IF NOT EXISTS idx_trades_asset ON trades(asset);
 CREATE INDEX IF NOT EXISTS idx_trades_won ON trades(won);
+CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON trades(exit_time);
 CREATE INDEX IF NOT EXISTS idx_transactions_timestamp ON transactions(timestamp);
 CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(tx_type);
 CREATE INDEX IF NOT EXISTS idx_daily_summary_date ON daily_summary(date);
 """
+
+
+def _empty_performance(since: Optional[str] = None) -> Dict[str, Any]:
+    """Zeroed performance aggregate, shaped exactly like a populated one."""
+    return {
+        "since": since,
+        "total_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate_pct": 0.0,
+        "gross_profit": 0.0,
+        "gross_loss": 0.0,
+        "net_pnl": 0.0,
+        "total_fees": 0.0,
+        "net_after_fees": 0.0,
+        "total_volume": 0.0,
+        "total_staked": 0.0,
+        "total_returned": 0.0,
+        "efficiency_pct": 0.0,
+        "profit_factor": None,
+        "largest_win": 0.0,
+        "largest_loss": 0.0,
+        "avg_trade_size": 0.0,
+        "avg_pnl_per_trade": 0.0,
+        "opening_balance": 0.0,
+        "start_balance": 0.0,
+        "end_balance": 0.0,
+        "balance_delta": 0.0,
+        "return_pct": 0.0,
+        "by_asset": {},
+        "by_side": {},
+        "first_exit_time": None,
+        "last_exit_time": None,
+    }
 
 
 class TradeLogger:
@@ -151,7 +187,23 @@ class TradeLogger:
         """Initialize database schema."""
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
         logger.info("Trade logger initialized: %s", self._db_path)
+
+    @staticmethod
+    def _migrate(conn) -> None:
+        """
+        Additive column migrations.
+
+        `CREATE TABLE IF NOT EXISTS` is a no-op on an already-created table,
+        so new columns have to be added explicitly. Every step is idempotent
+        and purely additive — nothing is dropped or retyped, so an existing
+        trade history stays intact.
+        """
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(trades)")}
+        if "balance_at_entry" not in columns:
+            conn.execute("ALTER TABLE trades ADD COLUMN balance_at_entry REAL DEFAULT 0.0")
+            logger.info("Migrated trades table: added balance_at_entry")
 
     @contextmanager
     def _connect(self):
@@ -194,11 +246,11 @@ class TradeLogger:
                     """INSERT INTO trades
                        (trade_id, timestamp, condition_id, asset, market_question,
                         entry_side, entry_price, entry_time, size_usd,
-                        strategy, source, bankroll_after, metadata_json)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        strategy, source, balance_at_entry, bankroll_after, metadata_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (trade_id, now, condition_id, asset, market_question,
                      side, price, now, size_usd,
-                     strategy, source, bankroll_after,
+                     strategy, source, bankroll_after, bankroll_after,
                      json.dumps(metadata or {})),
                 )
 
@@ -239,6 +291,9 @@ class TradeLogger:
                     (exit_price, now, exit_reason, pnl_usd, fees_usd, won,
                      bankroll_after, trade_id),
                 )
+                # `balance_at_entry` is deliberately left alone: it is the one
+                # record of the balance before this trade's stake went out,
+                # and reports need it to show a true before → after.
 
                 # Calculate PnL percentage from entry
                 row = conn.execute(
@@ -477,6 +532,146 @@ class TradeLogger:
             "session_fees": round(total_fees, 4),
             "session_duration_hours": round(duration_hours, 1),
             "current_bankroll": round(rows[-1]["bankroll_after"], 2),
+        }
+
+    def get_closed_trades_since(self, since: str, limit: int = 200) -> List[Dict]:
+        """
+        Closed trades (exit booked) at/after `since`, oldest first.
+
+        `since` is an ISO-8601 UTC string — the same format written to the
+        `exit_time` column, so plain string comparison is chronological.
+        The reporting window is defined by exit time, not entry time: a trade
+        entered at 12:04 and settled at 12:06 belongs to the window that
+        closed at 12:07, which is when its PnL actually hit the bankroll.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM trades
+                   WHERE exit_time IS NOT NULL AND exit_time >= ?
+                   ORDER BY exit_time ASC LIMIT ?""",
+                (since, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_transactions_since(self, since: str, limit: int = 500) -> List[Dict]:
+        """Ledger movements at/after `since`, oldest first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM transactions
+                   WHERE timestamp >= ? ORDER BY id ASC LIMIT ?""",
+                (since, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_balance_at(self, at: str) -> Optional[float]:
+        """
+        Ledger balance as it stood at `at` (ISO-8601 UTC).
+
+        Used as the "balance before" anchor for the first trade in a report
+        window, so the digest can show a real before → after rather than
+        guessing from the entry row.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT balance_after FROM transactions
+                   WHERE timestamp <= ? ORDER BY id DESC LIMIT 1""",
+                (at,),
+            ).fetchone()
+        return float(row["balance_after"]) if row and row["balance_after"] else None
+
+    def get_performance(self, since: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Full performance aggregate for a window (`since`) or the whole session.
+
+        Beyond the usual W/L rollup this carries the numbers that make a
+        report actionable: capital deployed, net ROI ("efficiency"), profit
+        factor, and the balance the window started and ended on.
+        """
+        with self._connect() as conn:
+            if since:
+                rows = conn.execute(
+                    """SELECT * FROM trades
+                       WHERE exit_price IS NOT NULL AND exit_time >= ?
+                       ORDER BY exit_time ASC""",
+                    (since,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT * FROM trades
+                       WHERE exit_price IS NOT NULL ORDER BY exit_time ASC"""
+                ).fetchall()
+
+        if not rows:
+            return _empty_performance(since)
+
+        total = len(rows)
+        wins = sum(1 for r in rows if r["pnl_usd"] > 0)
+        losses = total - wins
+        gross_profit = sum(r["pnl_usd"] for r in rows if r["pnl_usd"] > 0)
+        gross_loss = sum(r["pnl_usd"] for r in rows if r["pnl_usd"] < 0)
+        net_pnl = sum(r["pnl_usd"] for r in rows)
+        fees = sum(r["fees_usd"] or 0 for r in rows)
+        volume = sum(r["size_usd"] or 0 for r in rows)
+        pnls = [r["pnl_usd"] for r in rows]
+
+        # Capital actually put at risk — the denominator for efficiency.
+        staked = sum(r["size_usd"] or 0 for r in rows)
+        # What came back to the balance: stake recovered plus/minus PnL.
+        returned = staked + net_pnl
+
+        by_asset: Dict[str, Dict] = {}
+        by_side: Dict[str, Dict] = {}
+        for r in rows:
+            for bucket, key in ((by_asset, r["asset"]), (by_side, r["entry_side"])):
+                if key not in bucket:
+                    bucket[key] = {"trades": 0, "wins": 0, "pnl": 0.0}
+                bucket[key]["trades"] += 1
+                bucket[key]["wins"] += 1 if r["pnl_usd"] > 0 else 0
+                bucket[key]["pnl"] += r["pnl_usd"]
+
+        start_balance = rows[0]["bankroll_after"] or 0.0
+        end_balance = rows[-1]["bankroll_after"] or 0.0
+        # True pre-window balance: the ledger records the balance *after* the
+        # first trade's stake went out, so add the stake back. Falling back to
+        # `start - net_pnl` keeps pre-migration rows (no balance_at_entry)
+        # producing a sensible number rather than nothing.
+        first_entry_balance = rows[0]["balance_at_entry"] or 0.0
+        opening_balance = (
+            first_entry_balance + (rows[0]["size_usd"] or 0.0)
+            if first_entry_balance
+            else start_balance - net_pnl
+        )
+
+        return {
+            "since": since,
+            "total_trades": total,
+            "wins": wins,
+            "losses": losses,
+            "win_rate_pct": round(wins / total * 100, 1),
+            "gross_profit": round(gross_profit, 4),
+            "gross_loss": round(gross_loss, 4),
+            "net_pnl": round(net_pnl, 4),
+            "total_fees": round(fees, 4),
+            "net_after_fees": round(net_pnl - fees, 4),
+            "total_volume": round(volume, 2),
+            "total_staked": round(staked, 2),
+            "total_returned": round(returned, 2),
+            "efficiency_pct": round(net_pnl / staked * 100, 1) if staked > 0 else 0.0,
+            "profit_factor": round(gross_profit / abs(gross_loss), 2) if gross_loss < 0 else None,
+            "largest_win": round(max(pnls), 4),
+            "largest_loss": round(min(pnls), 4),
+            "avg_trade_size": round(volume / total, 2),
+            "avg_pnl_per_trade": round(net_pnl / total, 4),
+            "opening_balance": round(opening_balance, 2),
+            "start_balance": round(start_balance, 2),
+            "end_balance": round(end_balance, 2),
+            "balance_delta": round(end_balance - opening_balance, 2),
+            "return_pct": round((end_balance - opening_balance) / opening_balance * 100, 1)
+            if opening_balance > 0 else 0.0,
+            "by_asset": by_asset,
+            "by_side": by_side,
+            "first_exit_time": rows[0]["exit_time"],
+            "last_exit_time": rows[-1]["exit_time"],
         }
 
     def get_recent_trades(self, limit: int = 10) -> List[Dict]:

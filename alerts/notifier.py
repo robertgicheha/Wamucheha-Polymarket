@@ -20,42 +20,61 @@ class Severity(Enum):
 
 
 class Notifier:
-    def send(self, message: str, severity: Severity = Severity.INFO) -> None:
-        self._send_telegram(message, severity)
-        self._send_discord(message, severity)
+    def send(
+        self,
+        message: str,
+        severity: Severity = Severity.INFO,
+        prefix: bool = True,
+    ) -> None:
+        """
+        Dispatch to Telegram + Discord (email on CRITICAL).
+
+        `prefix=False` suppresses the `[INFO]` banner for messages that are
+        already self-describing — the periodic trade digest carries its own
+        header, emoji and severity colouring, and a second machine label on
+        top of that is noise.
+        """
+        self._send_telegram(message, severity, prefix)
+        self._send_discord(message, severity, prefix)
         if severity == Severity.CRITICAL:
             self._send_email(message)
+
+    def send_trade_digest(self, message: str) -> None:
+        """Send a trade digest. Never prefixed — the digest has its own header."""
+        self.send(message, Severity.INFO, prefix=False)
 
     def send_training(self, message: str, severity: Severity = Severity.INFO) -> None:
         """Send training mode notifications. Suppressed when TRAINING_MODE=false."""
         if not settings.training_mode:
             return
-        self._send_telegram(message, severity)
-        self._send_discord(message, severity)
+        self._send_telegram(message, severity, prefix=True)
+        self._send_discord(message, severity, prefix=True)
 
-    def _send_telegram(self, message: str, severity: Severity) -> None:
+    def _send_telegram(self, message: str, severity: Severity, prefix: bool = True) -> None:
         if not settings.telegram_bot_token or not settings.telegram_chat_id:
             return
         url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
+        text = f"[{severity.value.upper()}] {message}" if prefix else message
         try:
             requests.post(
                 url,
                 json={
                     "chat_id": settings.telegram_chat_id,
-                    "text": f"[{severity.value.upper()}] {message}",
+                    "text": text,
                 },
                 timeout=10,
             )
         except requests.RequestException as e:
             print(f"Telegram alert failed: {e}")
 
-    def _send_discord(self, message: str, severity: Severity) -> None:
+    def _send_discord(self, message: str, severity: Severity, prefix: bool = True) -> None:
         if not settings.discord_webhook_url:
             return
+        content = f"**[{severity.value.upper()}]** {message}" if prefix else message
         try:
             requests.post(
                 settings.discord_webhook_url,
-                json={"content": f"**[{severity.value.upper()}]** {message}"},
+                json={"content": content},
                 timeout=10,
             )
         except requests.RequestException as e:

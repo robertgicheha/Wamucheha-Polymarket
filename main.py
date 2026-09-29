@@ -463,7 +463,7 @@ def main():
         )
         fast_loop_thread.start()
 
-    # ── Start scheduler (5-min pings + hourly reports) ────────────────
+    # ── Start scheduler (5-min trade digests + hourly rollups) ─────────
     scheduler = BotScheduler(
         trade_logger=trade_logger,
         notifier=notifier,
@@ -477,6 +477,7 @@ def main():
             "win_rate": lifecycle_engine.stats.win_rate if lifecycle_engine else 0,
             "traded": lifecycle_engine.stats.total_markets_traded if lifecycle_engine else 0,
         } if lifecycle_engine else {},
+        mode=settings.trading_mode.upper(),
     )
     scheduler.start()
 
